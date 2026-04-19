@@ -1,0 +1,15 @@
+{
+  "name": "local",
+  "description": "Local custom plugins",
+  "plugins": [
+    {
+      "name": "claude-whatsapp",
+      "source": "./",
+      "description": "WhatsApp channel for Claude Code (hardened fork)",
+      "version": "0.1.0"
+    }
+  ],
+  "owner": {
+    "name": "ferran"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "name": "claude-whatsapp",
+  "description": "WhatsApp channel for Claude Code (hardened fork of PenguinMiaou/claude-channel-whatsapp) — native plugin, no OpenClaw. Manage pairing, allowlists via /whatsapp:access.",
+  "version": "0.1.0",
+  "keywords": [
+    "whatsapp",
+    "messaging",
+    "channel",
+    "mcp"
+  ]
+}
