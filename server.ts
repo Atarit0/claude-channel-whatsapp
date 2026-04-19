@@ -398,7 +398,14 @@ const mcp = new Server(
   {
     capabilities: {
       tools: {},
-      experimental: { 'claude/channel': {} },
+      experimental: {
+        'claude/channel': {},
+        // Permission-relay opt-in — required for claude CLI to deliver
+        // channel notifications. Declaring this asserts we authenticate the
+        // replier, which we do: gate()/access.allowFrom drops non-allowlisted
+        // senders before handleInboundMessage runs.
+        'claude/channel/permission': {},
+      },
     },
     instructions: [
       'The sender reads WhatsApp, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
@@ -678,8 +685,10 @@ async function connectWhatsApp(): Promise<void> {
   /* ---------------------------------------------------------------- */
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    info(`messages.upsert type=${type} count=${messages.length}`)
     if (type !== 'notify') return
     for (const msg of messages) {
+      info(`upsert msg: chat=${msg.key.remoteJid} fromMe=${msg.key.fromMe} id=${msg.key.id}`)
       try {
         await handleInboundMessage(msg)
       } catch (err) {
