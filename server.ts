@@ -91,7 +91,7 @@ mkdirSync(INBOX_DIR,    { recursive: true })
 /*  Expected account validation                                       */
 /* ------------------------------------------------------------------ */
 
-const EXPECTED_PHONE = '634567501'
+const EXPECTED_PHONE = '34634567501'
 const EXPECTED_JID   = EXPECTED_PHONE + '@s.whatsapp.net'
 
 /** Set to true if pairing completed with an unexpected JID */
