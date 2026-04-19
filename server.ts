@@ -1190,8 +1190,9 @@ async function respondViaClaude(
     ? `El usuario te envió una imagen en ${imagePath}. Lee la imagen con la tool Read y responde a su consulta.\n\nTexto acompañante: ${content}`
     : content
 
+  /* DASH_PROMPT_STDIN_V1 */
   const baseArgs = [
-    '-p', promptBody,
+    '-p',
     '--append-system-prompt', systemPrompt,
     '--settings', join(homedir(), '.claude/settings-whatsapp-responder.json'),
     '--dangerously-skip-permissions',
@@ -1210,12 +1211,17 @@ async function respondViaClaude(
     ? ['--session-id', sessionId]
     : ['--resume', sessionId]
 
-  const runClaude = async (args: string[]): Promise<{ code: number; stdout: string; stderr: string }> => {
+  const runClaude = async (args: string[], stdinData?: string): Promise<{ code: number; stdout: string; stderr: string }> => {
     const proc = Bun.spawn(['claude', ...args], {
+      stdin: stdinData !== undefined ? 'pipe' : 'ignore',
       stdout: 'pipe',
       stderr: 'pipe',
       cwd: homedir(),
     })
+    if (stdinData !== undefined && proc.stdin) {
+      proc.stdin.write(stdinData)
+      proc.stdin.end()
+    }
     const [stdout, stderr] = await Promise.all([
       new Response(proc.stdout).text(),
       new Response(proc.stderr).text(),
@@ -1228,7 +1234,7 @@ async function respondViaClaude(
     `(${isNewSession ? 'new' : 'resume'} session=${sessionId.slice(0, 8)}): ` +
     `${content.slice(0, 80).replace(/\n/g, ' ')}`,
   )
-  let { code, stdout: stdoutText, stderr: stderrText } = await runClaude([...sessionArgs, ...baseArgs])
+  let { code, stdout: stdoutText, stderr: stderrText } = await runClaude([...sessionArgs, ...baseArgs], promptBody)
 
   // Resume can fail if the session was pruned/corrupted. Drop the mapping
   // and retry once with a fresh session so the chat keeps working.
@@ -1237,7 +1243,7 @@ async function respondViaClaude(
     clearSessionId(chatJid)
     sessionId = crypto.randomUUID()
     isNewSession = true
-    ;({ code, stdout: stdoutText, stderr: stderrText } = await runClaude(['--session-id', sessionId, ...baseArgs]))
+    ;({ code, stdout: stdoutText, stderr: stderrText } = await runClaude(['--session-id', sessionId, ...baseArgs], promptBody))
   }
 
   if (code !== 0) {
