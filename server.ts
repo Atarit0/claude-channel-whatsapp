@@ -778,6 +778,7 @@ async function handleInboundMessage(msg: proto.IWebMessageInfo): Promise<void> {
 
   // Store for download_attachment
   recentMessages.set(msgId, msg)
+  if (msg.key) lastInboundKey.set(chatJid, msg.key)
   if (recentMessages.size > 100) {
     const oldest = recentMessages.keys().next().value
     if (oldest) recentMessages.delete(oldest)
@@ -1060,6 +1061,38 @@ function parseAttachments(raw: string): { text: string; attachments: Attachment[
   return { text: remaining.join('\n').trim(), attachments }
 }
 
+/* REACT_SIGIL_V1 */
+const lastInboundKey = new Map<string, proto.IMessageKey>()
+
+const REACT_RE = /^\s*\[\[REACT:(.+?)\]\]\s*$/
+
+function parseReactions(raw: string): { text: string; reactions: string[] } {
+  const reactions: string[] = []
+  const remaining: string[] = []
+  for (const line of raw.split('\n')) {
+    const m = line.match(REACT_RE)
+    if (m) {
+      const emoji = m[1].trim()
+      if (emoji) reactions.push(emoji)
+    } else {
+      remaining.push(line)
+    }
+  }
+  return { text: remaining.join('\n').trim(), reactions }
+}
+
+async function sendReaction(chatJid: string, emoji: string): Promise<void> {
+  if (!sock) return
+  const key = lastInboundKey.get(chatJid)
+  if (!key) { warn(`react: no inbound msg key for ${chatJid}`); return }
+  try {
+    await sock.sendMessage(chatJid, { react: { text: emoji, key } })
+    info(`reaction ${emoji} sent to ${chatJid}`)
+  } catch (err) {
+    error(`reaction send failed: ${err}`)
+  }
+}
+
 async function prepareVoiceBuffer(srcPath: string): Promise<{ buffer: Buffer; waveform?: Uint8Array; seconds?: number } | null> {
   const tmp = join(INBOX_DIR, `voice-out-${Date.now()}-${randomBytes(3).toString('hex')}.ogg`)
   const ff = Bun.spawn(
@@ -1148,6 +1181,7 @@ async function respondViaClaude(
     'Habla de ti misma en femenino. Nunca digas "mi nombre es" o te presentes de nuevo.',
     'No devuelvas ningún preámbulo tipo "Entendido" ni metacomentarios — escribe directamente la respuesta que leerá el usuario.',
     'Para adjuntar ficheros locales, escribe en una línea propia `[[ATTACH:/ruta/absoluta|modo]]`. Modos: voice, audio, image, doc. Si omites el modo se infiere por extensión. Estas líneas se eliminan del texto antes de enviar.',
+    'Para reaccionar al último mensaje del usuario con un emoji, escribe en su propia línea `[[REACT:<emoji>]]` (ej. `[[REACT:😂]]`). Úsalo SOLO cuando sea natural: una carcajada a un chiste, un 👍 a una buena idea, un ❤️ puntual. NO reacciones por defecto ni en cada mensaje — mejor callarte que parecer pesada. La línea se elimina del texto antes de enviar.',
     `El remitente es "${pushName}" (${chatJid}). Trátalo como mi Señor.`,
     ...(chatJid.endsWith('@g.us') ? ['Estás en un GRUPO, no en DM. Participa con naturalidad cuando tengas algo concreto que aportar (dato útil, corrección, broma oportuna, respuesta a algo que te mencione directamente). Si el mensaje no requiere tu intervención, responde con cadena vacía — sin disculpas, sin comentarios meta, solo silencio. No seas pesada ni comentes cada cosa.'] : []),
   ].join('\n')
@@ -1224,9 +1258,14 @@ async function respondViaClaude(
     return
   }
 
-  const { text: reply, attachments } = parseAttachments(raw)
-  info(`claude -p reply (${raw.length} chars, ${attachments.length} attach) for ${chatJid} session=${sessionId.slice(0, 8)}`)
+  const { text: afterAttach, attachments } = parseAttachments(raw)
+  const { text: reply, reactions } = parseReactions(afterAttach)
+  info(`claude -p reply (${raw.length} chars, ${attachments.length} attach, ${reactions.length} react) for ${chatJid} session=${sessionId.slice(0, 8)}`)
   if (!sock) return
+
+  for (const emoji of reactions) {
+    await sendReaction(chatJid, emoji)
+  }
 
   for (const att of attachments) {
     await sendAttachment(chatJid, att)
