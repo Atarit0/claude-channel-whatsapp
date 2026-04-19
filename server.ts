@@ -886,7 +886,7 @@ async function respondViaClaude(
   const proc = Bun.spawn(['claude', ...args], {
     stdout: 'pipe',
     stderr: 'pipe',
-    env: { ...process.env, CLAUDE_CODE_SIMPLE: '1' },
+    cwd: homedir(),
   })
   const [stdoutText, stderrText] = await Promise.all([
     new Response(proc.stdout).text(),
