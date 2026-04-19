@@ -808,8 +808,18 @@ async function handleInboundMessage(msg: proto.IWebMessageInfo): Promise<void> {
         writeFileSync(path, buffer as Buffer)
         attachmentMeta.attachment_path = path
         info(`audio saved to ${path} (${(buffer as Buffer).length} bytes)`)
+
+        // Transcribe with local Vosk (es model by default).
+        const transcript = await transcribeVosk(path, 'es')
+        if (transcript) {
+          text = transcript
+          attachmentMeta.transcript = transcript
+          info(`transcript (${transcript.length} chars): ${transcript.slice(0, 120)}`)
+        } else {
+          text = '(voice message — transcription empty)'
+        }
       } catch (err) {
-        error(`audio download failed: ${err}`)
+        error(`audio download/transcribe failed: ${err}`)
       }
       break
     }
@@ -872,6 +882,24 @@ async function handleInboundMessage(msg: proto.IWebMessageInfo): Promise<void> {
   // Primary delivery: spawn `claude -p` and send its stdout back as a reply.
   respondViaClaude(chatJid, text, pushName, imagePath)
     .catch(err => error(`respondViaClaude failed: ${err}`))
+}
+
+async function transcribeVosk(audioPath: string, lang: 'es' | 'ca' = 'es'): Promise<string> {
+  const script = join(homedir(), '.claude/plugins/claude-whatsapp/bin/transcribe.py')
+  const proc = Bun.spawn(['python3', script, audioPath, '--lang', lang], {
+    stdout: 'pipe',
+    stderr: 'pipe',
+  })
+  const [stdoutText, stderrText] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ])
+  const code = await proc.exited
+  if (code !== 0) {
+    error(`vosk transcribe exited ${code}: ${stderrText.slice(0, 300)}`)
+    return ''
+  }
+  return stdoutText.trim()
 }
 
 async function respondViaClaude(
