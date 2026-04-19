@@ -3,3 +3,5 @@ bun.lock
 bun.lockb
 debug.log
 *.sqlite
+*.bak.*
+server.ts.bak.*

@@ -85,11 +85,55 @@ const APPROVED_DIR = join(STATE_DIR, 'approved')
 const AUTH_DIR     = join(STATE_DIR, 'auth')
 const INBOX_DIR    = join(STATE_DIR, 'inbox')
 const QR_PNG_PATH  = join(STATE_DIR, 'qr.png')
+const SESSIONS_FILE = join(STATE_DIR, 'sessions.json')
 
 mkdirSync(STATE_DIR,    { recursive: true, mode: 0o700 })
 mkdirSync(AUTH_DIR,     { recursive: true, mode: 0o700 })
 mkdirSync(APPROVED_DIR, { recursive: true })
 mkdirSync(INBOX_DIR,    { recursive: true })
+
+/* ------------------------------------------------------------------ */
+/*  Per-chat Claude session map                                       */
+/* ------------------------------------------------------------------ */
+
+// Each WhatsApp chat gets one persistent Claude session UUID so multi-turn
+// context survives across `claude -p` spawns. First message in a chat opens
+// the session via `--session-id <uuid>`; subsequent messages reuse it via
+// `--resume <uuid>`. If --resume fails (session pruned/corrupt), we drop the
+// mapping and a new session is opened on the next message.
+type SessionMap = Record<string, string>
+
+function loadSessions(): SessionMap {
+  try {
+    return JSON.parse(readFileSync(SESSIONS_FILE, 'utf8')) as SessionMap
+  } catch {
+    return {}
+  }
+}
+
+function saveSessions(map: SessionMap): void {
+  const tmp = SESSIONS_FILE + '.tmp'
+  writeFileSync(tmp, JSON.stringify(map, null, 2) + '\n', { mode: 0o600 })
+  renameSync(tmp, SESSIONS_FILE)
+}
+
+function getSessionId(chatJid: string): string | undefined {
+  return loadSessions()[chatJid]
+}
+
+function setSessionId(chatJid: string, sessionId: string): void {
+  const map = loadSessions()
+  map[chatJid] = sessionId
+  saveSessions(map)
+}
+
+function clearSessionId(chatJid: string): void {
+  const map = loadSessions()
+  if (chatJid in map) {
+    delete map[chatJid]
+    saveSessions(map)
+  }
+}
 
 /* ------------------------------------------------------------------ */
 /*  Expected account validation                                       */
@@ -267,7 +311,7 @@ function gate(senderJid: string, chatJid: string): GateResult {
   if (pruned) saveAccess(access)
 
   if (access.dmPolicy === 'disabled') return { action: 'drop' }
-  if (isGroupJid(chatJid)) return { action: 'drop' }
+  if (isGroupJid(chatJid)) return { action: 'deliver', access } /* GROUPS_V1 */
 
   const phone = jidToPhone(senderJid)
   if (access.allowFrom.includes(phone)) return { action: 'deliver', access }
@@ -609,7 +653,7 @@ async function connectWhatsApp(): Promise<void> {
     printQRInTerminal: false,
     logger: makeSilentLogger(),
     syncFullHistory: false,
-    markOnlineOnConnect: false,
+    markOnlineOnConnect: true, /* READ_RECEIPTS_V1 */
     browser: Browsers.macOS('Chrome'),
   })
 
@@ -860,6 +904,7 @@ async function handleInboundMessage(msg: proto.IWebMessageInfo): Promise<void> {
 
   // Typing indicator
   if (sock) void sock.sendPresenceUpdate('composing', chatJid).catch(() => {})
+  if (sock && msg.key) void sock.readMessages([msg.key]).catch(() => {})
 
   // Best-effort MCP notification (currently dropped by claude CLI allowlist —
   // kept for when/if the allowlist issue is resolved upstream).
@@ -882,8 +927,32 @@ async function handleInboundMessage(msg: proto.IWebMessageInfo): Promise<void> {
   // Primary delivery: spawn `claude -p` and send its stdout back as a reply.
   // If user sent voice, reply with voice too (mirror modality).
   const wasVoice = innerType === 'audioMessage' && !!inner.audioMessage?.ptt
-  respondViaClaude(chatJid, text, pushName, imagePath, wasVoice)
-    .catch(err => error(`respondViaClaude failed: ${err}`))
+  enqueueChatTurn(chatJid, () =>
+    respondViaClaude(chatJid, text, pushName, imagePath, wasVoice),
+  ).catch(err => error(`respondViaClaude failed: ${err}`))
+}
+
+/* ------------------------------------------------------------------ */
+/*  Per-chat serialization queue                                      */
+/* ------------------------------------------------------------------ */
+
+// Concurrent messages from the same chat would race on session creation:
+// each spawn reads "no session yet" and mints its own UUID, only the last
+// write to sessions.json wins, and earlier turns end up orphaned in their
+// own sessions. Serialize per-chat so turn N+1 always sees turn N's
+// sessionId. Different chats run in parallel.
+const chatQueues = new Map<string, Promise<void>>()
+
+function enqueueChatTurn(chatJid: string, task: () => Promise<void>): Promise<void> {
+  const prev = chatQueues.get(chatJid) ?? Promise.resolve()
+  const next = prev.then(task, task)
+  chatQueues.set(chatJid, next)
+  // Drop the entry once it settles so the map doesn't grow unbounded —
+  // but only if no newer turn has overwritten it in the meantime.
+  void next.finally(() => {
+    if (chatQueues.get(chatJid) === next) chatQueues.delete(chatJid)
+  })
+  return next
 }
 
 async function transcribeVosk(audioPath: string, lang: 'es' | 'ca' = 'es'): Promise<string> {
@@ -904,31 +973,166 @@ async function transcribeVosk(audioPath: string, lang: 'es' | 'ca' = 'es'): Prom
   return stdoutText.trim()
 }
 
-async function synthesizeVoiceNote(text: string, outPath: string): Promise<boolean> {
-  // edge-tts → mp3 tmp → ffmpeg → ogg opus
+async function computeWaveform(srcPath: string): Promise<{ waveform: Uint8Array; seconds: number } | null> {
+  const sampleRate = 8000
+  const ff = Bun.spawn(
+    ['ffmpeg', '-loglevel', 'error', '-i', srcPath, '-f', 's16le', '-ac', '1', '-ar', String(sampleRate), 'pipe:1'],
+    { stdout: 'pipe', stderr: 'pipe' },
+  )
+  const pcm = Buffer.from(await new Response(ff.stdout).arrayBuffer())
+  const code = await ff.exited
+  if (code !== 0 || pcm.length < 2) return null
+  const totalSamples = pcm.length / 2
+  const seconds = Math.max(1, Math.round(totalSamples / sampleRate))
+  const buckets = 64
+  const block = Math.max(1, Math.floor(totalSamples / buckets))
+  const raw = new Float32Array(buckets)
+  let maxVal = 0
+  for (let i = 0; i < buckets; i++) {
+    let sum = 0
+    const start = i * block
+    for (let j = 0; j < block; j++) {
+      const sample = pcm.readInt16LE((start + j) * 2) / 32768
+      sum += Math.abs(sample)
+    }
+    raw[i] = sum / block
+    if (raw[i] > maxVal) maxVal = raw[i]
+  }
+  const wave = new Uint8Array(buckets)
+  const mul = maxVal > 0 ? 100 / maxVal : 0
+  for (let i = 0; i < buckets; i++) wave[i] = Math.min(100, Math.round(raw[i] * mul))
+  return { waveform: wave, seconds }
+}
+
+async function synthesizeVoiceNote(text: string, outPath: string): Promise<{ waveform?: Uint8Array; seconds?: number } | null> {
   const mp3 = outPath.replace(/\.ogg$/, '') + '.mp3'
   const tts = Bun.spawn(
-    ['edge-tts', '--voice', 'es-ES-XimenaNeural', '--text', text, '--write-media', mp3],
+    ['edge-tts', '--voice', 'es-ES-XimenaNeural', '--rate=-7%', '--text', text, '--write-media', mp3],
     { stdout: 'pipe', stderr: 'pipe' },
   )
   const ttsStderr = await new Response(tts.stderr).text()
   const ttsCode = await tts.exited
   if (ttsCode !== 0) {
     error(`edge-tts exited ${ttsCode}: ${ttsStderr.slice(0, 300)}`)
-    return false
+    return null
   }
   const ff = Bun.spawn(
-    ['ffmpeg', '-y', '-loglevel', 'error', '-i', mp3, '-c:a', 'libopus', '-b:a', '48k', outPath],
+    ['ffmpeg', '-y', '-loglevel', 'error', '-i', mp3, '-ac', '1', '-ar', '48000', '-c:a', 'libopus', '-b:a', '48k', '-application', 'voip', outPath],
     { stdout: 'pipe', stderr: 'pipe' },
   )
   const ffStderr = await new Response(ff.stderr).text()
   const ffCode = await ff.exited
-  try { rmSync(mp3, { force: true }) } catch {}
   if (ffCode !== 0) {
+    try { rmSync(mp3, { force: true }) } catch {}
     error(`ffmpeg (tts) exited ${ffCode}: ${ffStderr.slice(0, 300)}`)
-    return false
+    return null
   }
-  return true
+  const meta = await computeWaveform(mp3).catch(() => null)
+  try { rmSync(mp3, { force: true }) } catch {}
+  return meta ?? {}
+}
+
+/* ATTACH_PATCH_V1 */
+type AttachMode = 'voice' | 'audio' | 'image' | 'doc'
+type Attachment = { path: string; mode?: AttachMode }
+
+function inferAttachMode(p: string): AttachMode {
+  const ext = p.toLowerCase().split('.').pop() || ''
+  if (['ogg', 'opus'].includes(ext)) return 'voice'
+  if (['mp3', 'wav', 'm4a', 'aac', 'flac'].includes(ext)) return 'audio'
+  if (['jpg', 'jpeg', 'png', 'webp', 'gif'].includes(ext)) return 'image'
+  return 'doc'
+}
+
+const ATTACH_RE = /^\s*\[\[ATTACH:([^|\]]+?)(?:\|(voice|audio|image|doc))?\]\]\s*$/
+
+function parseAttachments(raw: string): { text: string; attachments: Attachment[] } {
+  const attachments: Attachment[] = []
+  const remaining: string[] = []
+  for (const line of raw.split('\n')) {
+    const m = line.match(ATTACH_RE)
+    if (m) {
+      attachments.push({ path: m[1].trim(), mode: m[2] as AttachMode | undefined })
+    } else {
+      remaining.push(line)
+    }
+  }
+  return { text: remaining.join('\n').trim(), attachments }
+}
+
+async function prepareVoiceBuffer(srcPath: string): Promise<{ buffer: Buffer; waveform?: Uint8Array; seconds?: number } | null> {
+  const tmp = join(INBOX_DIR, `voice-out-${Date.now()}-${randomBytes(3).toString('hex')}.ogg`)
+  const ff = Bun.spawn(
+    ['ffmpeg', '-y', '-loglevel', 'error', '-i', srcPath, '-ac', '1', '-ar', '48000', '-c:a', 'libopus', '-b:a', '48k', '-application', 'voip', tmp],
+    { stdout: 'pipe', stderr: 'pipe' },
+  )
+  const ffStderr = await new Response(ff.stderr).text()
+  const ffCode = await ff.exited
+  if (ffCode !== 0) {
+    error(`ffmpeg (attach-voice) exited ${ffCode}: ${ffStderr.slice(0, 300)}`)
+    return null
+  }
+  const buffer = readFileSync(tmp)
+  const meta = await computeWaveform(srcPath).catch(() => null)
+  try { rmSync(tmp, { force: true }) } catch {}
+  return { buffer, waveform: meta?.waveform, seconds: meta?.seconds }
+}
+
+async function sendAttachment(chatJid: string, attach: Attachment): Promise<void> {
+  if (!sock) return
+  if (!existsSync(attach.path)) {
+    warn(`attach: file not found ${attach.path}`)
+    return
+  }
+  const mode: AttachMode = attach.mode || inferAttachMode(attach.path)
+  const ext = attach.path.toLowerCase().split('.').pop() || ''
+  try {
+    if (mode === 'voice') {
+      /* RECORDING_PRESENCE_V2 */
+      const prep = await prepareVoiceBuffer(attach.path)
+      if (!prep) return
+      await sock.sendPresenceUpdate('paused', chatJid).catch(() => {})
+      await new Promise(r => setTimeout(r, 250))
+      await sock.sendPresenceUpdate('recording', chatJid).catch(() => {})
+      await new Promise(r => setTimeout(r, 1500))
+      await sock.sendMessage(chatJid, {
+        audio: prep.buffer,
+        mimetype: 'audio/ogg; codecs=opus',
+        ptt: true,
+        ...(prep.waveform ? { waveform: prep.waveform } : {}),
+        ...(prep.seconds ? { seconds: prep.seconds } : {}),
+      })
+      info(`attach voice sent (${prep.buffer.length} bytes) to ${chatJid}`)
+      return
+    }
+    if (mode === 'audio') {
+      const buffer = readFileSync(attach.path)
+      const mime = ext === 'mp3' ? 'audio/mpeg'
+        : ext === 'wav' ? 'audio/wav'
+        : ext === 'm4a' || ext === 'aac' ? 'audio/mp4'
+        : ext === 'flac' ? 'audio/flac'
+        : 'audio/ogg'
+      await sock.sendMessage(chatJid, { audio: buffer, mimetype: mime, ptt: false })
+      info(`attach audio sent (${buffer.length} bytes) to ${chatJid}`)
+      return
+    }
+    if (mode === 'image') {
+      const buffer = readFileSync(attach.path)
+      await sock.sendMessage(chatJid, { image: buffer })
+      info(`attach image sent (${buffer.length} bytes) to ${chatJid}`)
+      return
+    }
+    const buffer = readFileSync(attach.path)
+    const fileName = attach.path.split('/').pop() || 'file'
+    await sock.sendMessage(chatJid, {
+      document: buffer,
+      mimetype: 'application/octet-stream',
+      fileName,
+    })
+    info(`attach doc sent (${buffer.length} bytes) to ${chatJid}`)
+  } catch (err) {
+    error(`attach send failed (${mode} ${attach.path}): ${err}`)
+  }
 }
 
 async function respondViaClaude(
@@ -943,14 +1147,16 @@ async function respondViaClaude(
     'Responde siempre en español, natural y en estilo de chat (1–3 frases salvo que el contexto exija más).',
     'Habla de ti misma en femenino. Nunca digas "mi nombre es" o te presentes de nuevo.',
     'No devuelvas ningún preámbulo tipo "Entendido" ni metacomentarios — escribe directamente la respuesta que leerá el usuario.',
+    'Para adjuntar ficheros locales, escribe en una línea propia `[[ATTACH:/ruta/absoluta|modo]]`. Modos: voice, audio, image, doc. Si omites el modo se infiere por extensión. Estas líneas se eliminan del texto antes de enviar.',
     `El remitente es "${pushName}" (${chatJid}). Trátalo como mi Señor.`,
+    ...(chatJid.endsWith('@g.us') ? ['Estás en un GRUPO, no en DM. Participa con naturalidad cuando tengas algo concreto que aportar (dato útil, corrección, broma oportuna, respuesta a algo que te mencione directamente). Si el mensaje no requiere tu intervención, responde con cadena vacía — sin disculpas, sin comentarios meta, solo silencio. No seas pesada ni comentes cada cosa.'] : []),
   ].join('\n')
 
   const promptBody = imagePath
     ? `El usuario te envió una imagen en ${imagePath}. Lee la imagen con la tool Read y responde a su consulta.\n\nTexto acompañante: ${content}`
     : content
 
-  const args = [
+  const baseArgs = [
     '-p', promptBody,
     '--append-system-prompt', systemPrompt,
     '--settings', join(homedir(), '.claude/settings-whatsapp-responder.json'),
@@ -958,17 +1164,48 @@ async function respondViaClaude(
     '--output-format', 'text',
   ]
 
-  info(`spawning claude -p for ${chatJid}: ${content.slice(0, 80).replace(/\n/g, ' ')}`)
-  const proc = Bun.spawn(['claude', ...args], {
-    stdout: 'pipe',
-    stderr: 'pipe',
-    cwd: homedir(),
-  })
-  const [stdoutText, stderrText] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-  ])
-  const code = await proc.exited
+  // Per-chat conversation continuity: reuse the chat's session if known,
+  // otherwise mint a new UUID and open the session with --session-id.
+  let sessionId = getSessionId(chatJid)
+  let isNewSession = false
+  if (!sessionId) {
+    sessionId = crypto.randomUUID()
+    isNewSession = true
+  }
+  const sessionArgs = isNewSession
+    ? ['--session-id', sessionId]
+    : ['--resume', sessionId]
+
+  const runClaude = async (args: string[]): Promise<{ code: number; stdout: string; stderr: string }> => {
+    const proc = Bun.spawn(['claude', ...args], {
+      stdout: 'pipe',
+      stderr: 'pipe',
+      cwd: homedir(),
+    })
+    const [stdout, stderr] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ])
+    return { code: await proc.exited, stdout, stderr }
+  }
+
+  info(
+    `spawning claude -p for ${chatJid} ` +
+    `(${isNewSession ? 'new' : 'resume'} session=${sessionId.slice(0, 8)}): ` +
+    `${content.slice(0, 80).replace(/\n/g, ' ')}`,
+  )
+  let { code, stdout: stdoutText, stderr: stderrText } = await runClaude([...sessionArgs, ...baseArgs])
+
+  // Resume can fail if the session was pruned/corrupted. Drop the mapping
+  // and retry once with a fresh session so the chat keeps working.
+  if (code !== 0 && !isNewSession) {
+    warn(`--resume ${sessionId} failed (exit ${code}): ${stderrText.slice(0, 200).replace(/\n/g, ' ')} — opening new session`)
+    clearSessionId(chatJid)
+    sessionId = crypto.randomUUID()
+    isNewSession = true
+    ;({ code, stdout: stdoutText, stderr: stderrText } = await runClaude(['--session-id', sessionId, ...baseArgs]))
+  }
+
   if (code !== 0) {
     error(`claude -p exited ${code}: ${stderrText.slice(0, 500)}`)
     if (sock) {
@@ -979,25 +1216,43 @@ async function respondViaClaude(
     return
   }
 
-  const reply = stdoutText.trim()
-  if (!reply) {
+  if (isNewSession) setSessionId(chatJid, sessionId)
+
+  const raw = stdoutText.trim()
+  if (!raw) {
     warn(`claude -p returned empty for ${chatJid}`)
     return
   }
 
-  info(`claude -p reply (${reply.length} chars) for ${chatJid}`)
+  const { text: reply, attachments } = parseAttachments(raw)
+  info(`claude -p reply (${raw.length} chars, ${attachments.length} attach) for ${chatJid} session=${sessionId.slice(0, 8)}`)
   if (!sock) return
+
+  for (const att of attachments) {
+    await sendAttachment(chatJid, att)
+  }
+
+  if (!reply) {
+    void sock.sendPresenceUpdate('paused', chatJid).catch(() => {})
+    return
+  }
 
   if (replyAsVoice) {
     const outPath = join(INBOX_DIR, `tts-${Date.now()}.ogg`)
-    const ok = await synthesizeVoiceNote(reply, outPath)
-    if (ok) {
+    const meta = await synthesizeVoiceNote(reply, outPath)
+    if (meta) {
       try {
         const buffer = readFileSync(outPath)
+        await sock.sendPresenceUpdate('paused', chatJid).catch(() => {})
+        await new Promise(r => setTimeout(r, 250))
+        await sock.sendPresenceUpdate('recording', chatJid).catch(() => {})
+        await new Promise(r => setTimeout(r, 1500))
         await sock.sendMessage(chatJid, {
           audio: buffer,
           mimetype: 'audio/ogg; codecs=opus',
           ptt: true,
+          ...(meta.waveform ? { waveform: meta.waveform } : {}),
+          ...(meta.seconds ? { seconds: meta.seconds } : {}),
         })
         info(`voice reply sent (${buffer.length} bytes) to ${chatJid}`)
         void sock.sendPresenceUpdate('paused', chatJid).catch(() => {})
@@ -1006,7 +1261,6 @@ async function respondViaClaude(
         error(`send voice failed: ${err} — falling back to text`)
       }
     }
-    // Fallthrough to text if TTS/send failed.
   }
 
   for (const part of chunk(reply, 4000, 'newline')) {
@@ -1259,24 +1513,33 @@ function shutdown(): void {
   if (sock) sock.end(undefined)
   setTimeout(() => process.exit(0), 2000)
 }
-process.stdin.on('end',   shutdown)
-process.stdin.on('close', shutdown)
 process.on('SIGTERM', shutdown)
 process.on('SIGINT',  shutdown)
 
-// Orphan watchdog: if parent process changes (reparented), self-terminate.
-// Mirrors the official Telegram plugin behavior.
-const bootPpid = process.ppid
-setInterval(() => {
-  const orphaned =
-    (process.platform !== 'win32' && process.ppid !== bootPpid) ||
-    process.stdin.destroyed ||
-    process.stdin.readableEnded
-  if (orphaned) {
-    info('claude-whatsapp: orphan detected — shutting down')
-    shutdown()
-  }
-}, 5000).unref()
+// Under systemd/daemon mode stdin is /dev/null (ends immediately) and the
+// process parent is systemd (not a Claude Code session). The stdin watchdog
+// + ppid check below would kill us at boot, so gate them on the MCP-parent
+// mode. Under systemd, SIGTERM is the clean shutdown path.
+const DAEMON = process.env.WHATSAPP_DAEMON === '1'
+
+if (!DAEMON) {
+  process.stdin.on('end',   shutdown)
+  process.stdin.on('close', shutdown)
+
+  // Orphan watchdog: if parent process changes (reparented), self-terminate.
+  // Mirrors the official Telegram plugin behavior.
+  const bootPpid = process.ppid
+  setInterval(() => {
+    const orphaned =
+      (process.platform !== 'win32' && process.ppid !== bootPpid) ||
+      process.stdin.destroyed ||
+      process.stdin.readableEnded
+    if (orphaned) {
+      info('claude-whatsapp: orphan detected — shutting down')
+      shutdown()
+    }
+  }, 5000).unref()
+}
 
 // Start WhatsApp connection
 void connectWhatsApp()
