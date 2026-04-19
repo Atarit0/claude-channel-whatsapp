@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # claude-whatsapp start.sh — arranca el plugin en foreground con bun
-# Invocado por el helper ~/bin/claude-whatsapp-up via tmux
 set -euo pipefail
+
+export PATH="$HOME/.bun/bin:$PATH"
 
 PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../" && pwd)"
 cd "$PLUGIN_DIR"
