@@ -876,7 +876,7 @@ async function respondViaClaude(
   const args = [
     '-p', content,
     '--append-system-prompt', systemPrompt,
-    '--settings', join(homedir(), '.claude/settings-whatsapp-only.json'),
+    '--settings', join(homedir(), '.claude/settings-whatsapp-responder.json'),
     '--dangerously-skip-permissions',
     '--output-format', 'text',
   ]
