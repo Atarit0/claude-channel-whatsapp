@@ -37,6 +37,7 @@ import makeWASocket, {
   DisconnectReason,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
+  Browsers,
   type WASocket,
   type proto,
   downloadMediaMessage,
@@ -584,6 +585,7 @@ async function connectWhatsApp(): Promise<void> {
     logger: makeSilentLogger(),
     syncFullHistory: false,
     markOnlineOnConnect: false,
+    browser: Browsers.macOS('Chrome'),
   })
 
   sock.ev.on('creds.update', saveCreds)
