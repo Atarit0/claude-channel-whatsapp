@@ -4,7 +4,7 @@
  *
  * Fork of PenguinMiaou/claude-channel-whatsapp (SHA: 6d283a5ddc1674eafa0f68624be9a65894d63b7a)
  *
- * Improvements over upstream:
+ * Phase 1 improvements:
  *   - Exponential backoff reconnect (1s→2s→4s→8s→16s→32s→60s max, jitter, reset on open)
  *   - Orphan watchdog (ppid polling every 5s, like the official Telegram plugin)
  *   - Message deduplication (LRU set of last 500 message IDs, prevents replay on reconnect)
@@ -13,9 +13,16 @@
  *   - State dir: ~/.claude/channels/claude-whatsapp/ (independent from upstream)
  *   - @hapi/boom declared explicitly in package.json
  *
+ * Phase 2 improvements:
+ *   - QR state with timestamp + TTL (60s), no duplicate log spam
+ *   - QR rendered as ASCII in stdout AND as PNG (~480px) in state dir
+ *   - MCP tool `get_pairing_state` for /whatsapp:configure skill
+ *   - Force QR regeneration via disconnect+reconnect when TTL expired
+ *   - Number validation: expected JID 634567501@s.whatsapp.net
+ *     If pairing completes with a different number → WARNING + unexpected_account flag
+ *
  * MCP tool names follow the same pattern as the official Telegram plugin:
- *   reply, react, download_attachment
- * (edit_message is omitted — WhatsApp has no edit API)
+ *   reply, react, download_attachment, get_pairing_state
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -43,6 +50,7 @@ import {
 import { homedir } from 'os'
 import { join, extname, sep, basename } from 'path'
 import { Boom } from '@hapi/boom'
+import QRCode from 'qrcode'
 
 /* ------------------------------------------------------------------ */
 /*  Logging — stdout, ISO timestamps, level                           */
@@ -59,7 +67,7 @@ const info  = (msg: string) => log('INFO',  msg)
 const warn  = (msg: string) => log('WARN',  msg)
 const error = (msg: string) => log('ERROR', msg)
 
-info('claude-whatsapp: server starting')
+info('claude-whatsapp: server starting (phase 2)')
 
 /* ------------------------------------------------------------------ */
 /*  Paths & directories                                               */
@@ -71,11 +79,23 @@ const ACCESS_FILE  = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const AUTH_DIR     = join(STATE_DIR, 'auth')
 const INBOX_DIR    = join(STATE_DIR, 'inbox')
+const QR_PNG_PATH  = join(STATE_DIR, 'qr.png')
 
 mkdirSync(STATE_DIR,    { recursive: true, mode: 0o700 })
 mkdirSync(AUTH_DIR,     { recursive: true, mode: 0o700 })
 mkdirSync(APPROVED_DIR, { recursive: true })
 mkdirSync(INBOX_DIR,    { recursive: true })
+
+/* ------------------------------------------------------------------ */
+/*  Expected account validation                                       */
+/* ------------------------------------------------------------------ */
+
+const EXPECTED_PHONE = '634567501'
+const EXPECTED_JID   = EXPECTED_PHONE + '@s.whatsapp.net'
+
+/** Set to true if pairing completed with an unexpected JID */
+let unexpectedAccount = false
+let pairedJid: string | null = null
 
 /* ------------------------------------------------------------------ */
 /*  Safety nets                                                       */
@@ -159,6 +179,12 @@ function saveAccess(a: Access): void {
 }
 
 function assertAllowedChat(chatId: string): void {
+  if (unexpectedAccount) {
+    throw new Error(
+      `send blocked: paired account (${pairedJid}) does not match expected ${EXPECTED_JID}. ` +
+      'Confirm with /whatsapp:configure before sending.'
+    )
+  }
   const access = loadAccess()
   const phone = jidToPhone(chatId)
   if (access.allowFrom.includes(phone)) return
@@ -297,11 +323,73 @@ function markdownToWhatsApp(text: string): string {
 }
 
 /* ------------------------------------------------------------------ */
+/*  QR state — TTL, dedup, PNG render                                 */
+/* ------------------------------------------------------------------ */
+
+const QR_TTL_MS = 60_000  // 60 seconds — WhatsApp standard QR lifetime
+
+interface QrState {
+  data: string        // raw QR string from Baileys
+  issuedAt: number    // ms timestamp when issued
+  lastLoggedData: string  // to suppress duplicate log lines
+}
+
+let qrState: QrState | null = null
+
+function qrTtlRemaining(): number {
+  if (!qrState) return 0
+  return Math.max(0, qrState.issuedAt + QR_TTL_MS - Date.now())
+}
+
+function qrIsAlive(): boolean {
+  return qrTtlRemaining() > 0
+}
+
+async function handleNewQr(qrData: string): Promise<void> {
+  const now = Date.now()
+
+  // Suppress duplicate log spam: only log if data changed OR if >10s passed
+  const isDup = qrState?.lastLoggedData === qrData
+  if (!isDup) {
+    qrState = { data: qrData, issuedAt: now, lastLoggedData: qrData }
+
+    info('claude-whatsapp: QR code generated — no auth found')
+
+    // Render ASCII to stdout so tmux attach shows it
+    try {
+      const ascii = await QRCode.toString(qrData, { type: 'terminal', small: true })
+      process.stdout.write('\n=== WhatsApp QR Code (scan within 60s) ===\n')
+      process.stdout.write(ascii)
+      process.stdout.write('==========================================\n\n')
+    } catch (e) {
+      warn(`QR ASCII render failed: ${e}`)
+    }
+
+    // Render PNG ~480px to state dir
+    try {
+      const pngBuffer = await QRCode.toBuffer(qrData, {
+        type: 'png',
+        width: 480,
+        margin: 2,
+        color: { dark: '#000000', light: '#ffffff' },
+      })
+      writeFileSync(QR_PNG_PATH, pngBuffer)
+      info(`claude-whatsapp: QR PNG written to ${QR_PNG_PATH}`)
+    } catch (e) {
+      warn(`QR PNG render failed: ${e}`)
+    }
+  } else {
+    // Same QR data — just update timestamp for TTL tracking but don't re-render
+    if (qrState) qrState.issuedAt = now
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /*  MCP server                                                        */
 /* ------------------------------------------------------------------ */
 
 const mcp = new Server(
-  { name: 'claude-whatsapp', version: '0.1.0' },
+  { name: 'claude-whatsapp', version: '0.2.0' },
   {
     capabilities: {
       tools: {},
@@ -359,6 +447,25 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           message_json: { type: 'string', description: 'The attachment_data JSON string from inbound meta' },
         },
         required: ['message_json'],
+      },
+    },
+    {
+      name: 'get_pairing_state',
+      description: [
+        'Returns the current WhatsApp pairing/connection state.',
+        'Use this from /whatsapp:configure to check if auth is needed and whether a QR is ready.',
+        'If status is "awaiting_qr" and qr_ttl_seconds > 0, the PNG is ready at qr_png_path.',
+        'If qr_ttl_seconds <= 0, call this tool with force_regenerate: true to get a fresh QR.',
+      ].join(' '),
+      inputSchema: {
+        type: 'object',
+        properties: {
+          force_regenerate: {
+            type: 'boolean',
+            description: 'If true and QR has expired, disconnect and reconnect to force a new QR.',
+          },
+        },
+        required: [],
       },
     },
   ],
@@ -445,7 +552,7 @@ function isCredsInvalidState(authDir: string): boolean {
 async function connectWhatsApp(): Promise<void> {
   if (shuttingDown) return
 
-  // Early detection: registered:false → do NOT attempt connection
+  // Early detection: registered:false — do NOT attempt connection
   if (isCredsInvalidState(AUTH_DIR)) {
     info('claude-whatsapp: waiting in "pairing required" state — not connecting to avoid auth loop')
     info('claude-whatsapp: to re-pair: rm -rf ~/.claude/channels/claude-whatsapp/auth/* && restart')
@@ -481,17 +588,11 @@ async function connectWhatsApp(): Promise<void> {
 
   sock.ev.on('creds.update', saveCreds)
 
-  sock.ev.on('connection.update', (update) => {
+  sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update
 
     if (qr) {
-      info('claude-whatsapp: QR code generated — no auth found')
-      info('claude-whatsapp: QR written to /tmp/wa-qr.txt for /whatsapp:configure')
-      try {
-        writeFileSync('/tmp/wa-qr.txt', qr, 'utf8')
-      } catch (e) {
-        error(`failed to write QR: ${e}`)
-      }
+      await handleNewQr(qr)
     }
 
     if (connection === 'close') {
@@ -516,6 +617,23 @@ async function connectWhatsApp(): Promise<void> {
     if (connection === 'open') {
       connectionReady = true
       resetBackoff()
+      qrState = null  // Clear QR state — we're connected
+
+      // Extract our own JID to validate expected account
+      const myJid = sock?.user?.id
+      if (myJid) {
+        const myPhone = myJid.split('@')[0].split(':')[0]
+        pairedJid = myJid
+        if (myPhone !== EXPECTED_PHONE) {
+          warn(`UNEXPECTED ACCOUNT: connected as ${myJid} but expected ${EXPECTED_JID}`)
+          warn(`Sending tools are BLOCKED until /whatsapp:configure confirms this account.`)
+          unexpectedAccount = true
+        } else {
+          info(`claude-whatsapp: connected as expected account ${myJid}`)
+          unexpectedAccount = false
+        }
+      }
+
       info('claude-whatsapp: connected and ready')
     }
   })
@@ -564,7 +682,7 @@ async function handleInboundMessage(msg: proto.IWebMessageInfo): Promise<void> {
     const lead = result.isResend ? 'Still pending' : 'Pairing required'
     if (sock) {
       await sock.sendMessage(chatJid, {
-        text: `${lead} \u2014 run in Claude Code:\n\n/whatsapp:access pair ${result.code}`,
+        text: `${lead} — run in Claude Code:\n\n/whatsapp:access pair ${result.code}`,
       })
     }
     return
@@ -816,6 +934,84 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const path = join(INBOX_DIR, `${Date.now()}-${messageId}.${ext}`)
         writeFileSync(path, buffer as Buffer)
         return { content: [{ type: 'text', text: path }] }
+      }
+
+      case 'get_pairing_state': {
+        const forceRegenerate = args.force_regenerate === true
+
+        // If already connected
+        if (connectionReady && sock) {
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                status: 'paired',
+                jid: pairedJid,
+                unexpected_account: unexpectedAccount,
+                expected_jid: EXPECTED_JID,
+              }),
+            }],
+          }
+        }
+
+        // If we have a live QR
+        if (qrState && qrIsAlive()) {
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                status: 'awaiting_qr',
+                qr_png_path: QR_PNG_PATH,
+                qr_ttl_seconds: Math.round(qrTtlRemaining() / 1000),
+                expected_jid: EXPECTED_JID,
+              }),
+            }],
+          }
+        }
+
+        // QR expired or not yet generated
+        if (forceRegenerate) {
+          info('claude-whatsapp: get_pairing_state force_regenerate=true — triggering reconnect')
+          // Reset QR state and reconnect to get a new QR
+          qrState = null
+          void connectWhatsApp()
+          // Give it a moment to fire the QR event
+          await new Promise(resolve => setTimeout(resolve, 3000))
+          if (qrState && qrIsAlive()) {
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  status: 'awaiting_qr',
+                  qr_png_path: QR_PNG_PATH,
+                  qr_ttl_seconds: Math.round(qrTtlRemaining() / 1000),
+                  expected_jid: EXPECTED_JID,
+                }),
+              }],
+            }
+          }
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                status: 'regenerating',
+                message: 'Reconnect triggered — call again in 5s',
+                expected_jid: EXPECTED_JID,
+              }),
+            }],
+          }
+        }
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              status: 'qr_expired',
+              message: 'QR has expired. Call with force_regenerate: true to get a new one.',
+              expected_jid: EXPECTED_JID,
+            }),
+          }],
+        }
       }
 
       default:
