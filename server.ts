@@ -47,6 +47,7 @@ import { randomBytes } from 'crypto'
 import {
   readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync,
   statSync, renameSync, realpathSync, chmodSync, existsSync,
+  appendFileSync,
 } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep, basename } from 'path'
@@ -59,9 +60,12 @@ import QRCode from 'qrcode'
 
 type LogLevel = 'INFO' | 'WARN' | 'ERROR'
 
+const LOG_FILE = join(homedir(), '.claude', 'channels', 'claude-whatsapp', 'server.log')
 function log(level: LogLevel, msg: string): void {
   const ts = new Date().toISOString()
-  process.stderr.write(`[${ts}] [${level}] ${msg}\n`)
+  const line = `[${ts}] [${level}] ${msg}\n`
+  process.stderr.write(line)
+  try { appendFileSync(LOG_FILE, line) } catch {}
 }
 
 const info  = (msg: string) => log('INFO',  msg)
