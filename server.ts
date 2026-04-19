@@ -880,7 +880,9 @@ async function handleInboundMessage(msg: proto.IWebMessageInfo): Promise<void> {
   }).catch(() => {})
 
   // Primary delivery: spawn `claude -p` and send its stdout back as a reply.
-  respondViaClaude(chatJid, text, pushName, imagePath)
+  // If user sent voice, reply with voice too (mirror modality).
+  const wasVoice = innerType === 'audioMessage' && !!inner.audioMessage?.ptt
+  respondViaClaude(chatJid, text, pushName, imagePath, wasVoice)
     .catch(err => error(`respondViaClaude failed: ${err}`))
 }
 
@@ -902,11 +904,39 @@ async function transcribeVosk(audioPath: string, lang: 'es' | 'ca' = 'es'): Prom
   return stdoutText.trim()
 }
 
+async function synthesizeVoiceNote(text: string, outPath: string): Promise<boolean> {
+  // edge-tts → mp3 tmp → ffmpeg → ogg opus
+  const mp3 = outPath.replace(/\.ogg$/, '') + '.mp3'
+  const tts = Bun.spawn(
+    ['edge-tts', '--voice', 'es-ES-XimenaNeural', '--text', text, '--write-media', mp3],
+    { stdout: 'pipe', stderr: 'pipe' },
+  )
+  const ttsStderr = await new Response(tts.stderr).text()
+  const ttsCode = await tts.exited
+  if (ttsCode !== 0) {
+    error(`edge-tts exited ${ttsCode}: ${ttsStderr.slice(0, 300)}`)
+    return false
+  }
+  const ff = Bun.spawn(
+    ['ffmpeg', '-y', '-loglevel', 'error', '-i', mp3, '-c:a', 'libopus', '-b:a', '48k', outPath],
+    { stdout: 'pipe', stderr: 'pipe' },
+  )
+  const ffStderr = await new Response(ff.stderr).text()
+  const ffCode = await ff.exited
+  try { rmSync(mp3, { force: true }) } catch {}
+  if (ffCode !== 0) {
+    error(`ffmpeg (tts) exited ${ffCode}: ${ffStderr.slice(0, 300)}`)
+    return false
+  }
+  return true
+}
+
 async function respondViaClaude(
   chatJid: string,
   content: string,
   pushName: string,
   imagePath: string | undefined,
+  replyAsVoice: boolean,
 ): Promise<void> {
   const systemPrompt = [
     'Eres Elsa, asistente IA personal de mi Señor Fer. Te comunicas con él por WhatsApp.',
@@ -957,6 +987,28 @@ async function respondViaClaude(
 
   info(`claude -p reply (${reply.length} chars) for ${chatJid}`)
   if (!sock) return
+
+  if (replyAsVoice) {
+    const outPath = join(INBOX_DIR, `tts-${Date.now()}.ogg`)
+    const ok = await synthesizeVoiceNote(reply, outPath)
+    if (ok) {
+      try {
+        const buffer = readFileSync(outPath)
+        await sock.sendMessage(chatJid, {
+          audio: buffer,
+          mimetype: 'audio/ogg; codecs=opus',
+          ptt: true,
+        })
+        info(`voice reply sent (${buffer.length} bytes) to ${chatJid}`)
+        void sock.sendPresenceUpdate('paused', chatJid).catch(() => {})
+        return
+      } catch (err) {
+        error(`send voice failed: ${err} — falling back to text`)
+      }
+    }
+    // Fallthrough to text if TTS/send failed.
+  }
+
   for (const part of chunk(reply, 4000, 'newline')) {
     await sock.sendMessage(chatJid, { text: part }).catch(err => {
       error(`send reply failed: ${err}`)
