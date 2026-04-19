@@ -873,14 +873,17 @@ async function respondViaClaude(
     `El remitente es "${pushName}" (${chatJid}). Trátalo como mi Señor.`,
   ].join('\n')
 
+  const promptBody = imagePath
+    ? `El usuario te envió una imagen en ${imagePath}. Lee la imagen con la tool Read y responde a su consulta.\n\nTexto acompañante: ${content}`
+    : content
+
   const args = [
-    '-p', content,
+    '-p', promptBody,
     '--append-system-prompt', systemPrompt,
     '--settings', join(homedir(), '.claude/settings-whatsapp-responder.json'),
     '--dangerously-skip-permissions',
     '--output-format', 'text',
   ]
-  if (imagePath) args.push('--file', `inbound:${imagePath}`)
 
   info(`spawning claude -p for ${chatJid}: ${content.slice(0, 80).replace(/\n/g, ' ')}`)
   const proc = Bun.spawn(['claude', ...args], {
