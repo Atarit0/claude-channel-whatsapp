@@ -61,7 +61,7 @@ type LogLevel = 'INFO' | 'WARN' | 'ERROR'
 
 function log(level: LogLevel, msg: string): void {
   const ts = new Date().toISOString()
-  process.stdout.write(`[${ts}] [${level}] ${msg}\n`)
+  process.stderr.write(`[${ts}] [${level}] ${msg}\n`)
 }
 
 const info  = (msg: string) => log('INFO',  msg)
