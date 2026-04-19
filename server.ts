@@ -400,11 +400,11 @@ const mcp = new Server(
       tools: {},
       experimental: {
         'claude/channel': {},
-        // Permission-relay opt-in — required for claude CLI to deliver
-        // channel notifications. Declaring this asserts we authenticate the
-        // replier, which we do: gate()/access.allowFrom drops non-allowlisted
-        // senders before handleInboundMessage runs.
-        'claude/channel/permission': {},
+        // Intentionally NOT declaring 'claude/channel/permission' — we don't
+        // handle permission relays, and declaring it would cause claude CLI
+        // to spam the user with "Permission: Edit / Allowed" dialogs through
+        // WhatsApp (same pollution the telegram plugin causes when its owner
+        // has bypass enabled).
       },
     },
     instructions: [
