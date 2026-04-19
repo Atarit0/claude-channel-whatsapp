@@ -531,7 +531,15 @@ function makeSilentLogger() {
 
 /**
  * Detect registered:false in creds before attempting a connection.
- * Returns true if creds exist but are in an invalid state.
+ * Returns true ONLY if creds exist, registered=false, AND there is no
+ * evidence of a recent pairing attempt (noiseKey present = pairing happened,
+ * 515 reconnect will flip registered to true on second connection).
+ *
+ * NOTE: after a first pairing Baileys closes the stream with 515
+ * (restartRequired) and creds.json has registered=false at that point.
+ * We must NOT treat this as an error — connectWhatsApp() will be called
+ * again immediately and the second connection will write registered=true.
+ * We only bail out if there is truly no pairing in progress (no noiseKey).
  */
 function isCredsInvalidState(authDir: string): boolean {
   const credsPath = join(authDir, 'creds.json')
@@ -539,7 +547,13 @@ function isCredsInvalidState(authDir: string): boolean {
   try {
     const creds = JSON.parse(readFileSync(credsPath, 'utf8'))
     if (creds.registered === false) {
-      warn('creds.json exists but registered=false — session never completed handshake.')
+      // If noiseKey is present, a pairing happened and we are mid-handshake.
+      // The reconnect after 515 will complete registration — do NOT halt.
+      if (creds.noiseKey) {
+        info('creds.json: registered=false but noiseKey present — mid-pairing state, will reconnect')
+        return false
+      }
+      warn('creds.json exists but registered=false and no noiseKey — session never completed handshake.')
       warn('Pairing required. Delete auth/ contents and restart to re-pair, or run /whatsapp:configure.')
       return true
     }
@@ -600,16 +614,31 @@ async function connectWhatsApp(): Promise<void> {
     if (connection === 'close') {
       connectionReady = false
       const reason = (lastDisconnect?.error as Boom)?.output?.statusCode
-      const isLoggedOut = reason === DisconnectReason.loggedOut
 
       warn(`connection closed — reason code: ${reason ?? 'unknown'}`)
 
-      if (isLoggedOut) {
-        warn('logged out — need manual re-authentication. Not reconnecting.')
+      // 515 = restartRequired: normal Baileys behaviour after first pairing.
+      // WhatsApp closes the stream so the client reconnects and gets
+      // registered=true on the second connection. Reconnect immediately,
+      // no backoff, do NOT treat as failure.
+      if (reason === DisconnectReason.restartRequired) {
+        info('DisconnectReason.restartRequired (515) — normal post-pairing close, reconnecting immediately')
+        if (!shuttingDown) void connectWhatsApp()
+        return
+      }
+
+      // 401 = loggedOut: session invalidated by WhatsApp, cannot reconnect.
+      if (reason === DisconnectReason.loggedOut) {
+        warn('logged out (401) — need manual re-authentication. Not reconnecting.')
+        warn('Run: rm -rf ~/.claude/channels/claude-whatsapp/auth/* && restart')
         return
       }
 
       if (shuttingDown) return
+
+      if (reason === undefined) {
+        warn(`unknown disconnect reason — applying default backoff`)
+      }
 
       const delay = nextBackoffMs()
       info(`reconnecting in ${delay}ms (step ${backoffStep})...`)
