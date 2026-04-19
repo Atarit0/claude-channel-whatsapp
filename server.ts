@@ -791,10 +791,25 @@ async function handleInboundMessage(msg: proto.IWebMessageInfo): Promise<void> {
     }
     case 'audioMessage': {
       text = '(voice message)'
+      const isPtt = inner.audioMessage?.ptt
+      const mime = inner.audioMessage?.mimetype || 'audio/ogg'
       attachmentMeta = {
-        attachment_kind: inner.audioMessage?.ptt ? 'voice' : 'audio',
-        attachment_mime: inner.audioMessage?.mimetype || 'audio/ogg',
+        attachment_kind: isPtt ? 'voice' : 'audio',
+        attachment_mime: mime,
         attachment_message_id: msgId,
+      }
+      try {
+        const buffer = await downloadMediaMessage(msg, 'buffer', {}, {
+          logger: makeSilentLogger(),
+          reuploadRequest: sock!.updateMediaMessage,
+        })
+        const ext = mime.includes('ogg') ? 'ogg' : (mime.split('/')[1] || 'bin').split(';')[0]
+        const path = join(INBOX_DIR, `${Date.now()}-${msgId}.${ext}`)
+        writeFileSync(path, buffer as Buffer)
+        attachmentMeta.attachment_path = path
+        info(`audio saved to ${path} (${(buffer as Buffer).length} bytes)`)
+      } catch (err) {
+        error(`audio download failed: ${err}`)
       }
       break
     }
