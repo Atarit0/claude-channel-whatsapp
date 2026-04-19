@@ -836,6 +836,8 @@ async function handleInboundMessage(msg: proto.IWebMessageInfo): Promise<void> {
   // Typing indicator
   if (sock) void sock.sendPresenceUpdate('composing', chatJid).catch(() => {})
 
+  // Best-effort MCP notification (currently dropped by claude CLI allowlist —
+  // kept for when/if the allowlist issue is resolved upstream).
   mcp.notification({
     method: 'notifications/claude/channel',
     params: {
@@ -850,9 +852,71 @@ async function handleInboundMessage(msg: proto.IWebMessageInfo): Promise<void> {
         ...(attachmentMeta ?? {}),
       },
     },
-  }).catch(err => {
-    error(`failed to deliver inbound to Claude: ${err}`)
+  }).catch(() => {})
+
+  // Primary delivery: spawn `claude -p` and send its stdout back as a reply.
+  respondViaClaude(chatJid, text, pushName, imagePath)
+    .catch(err => error(`respondViaClaude failed: ${err}`))
+}
+
+async function respondViaClaude(
+  chatJid: string,
+  content: string,
+  pushName: string,
+  imagePath: string | undefined,
+): Promise<void> {
+  const systemPrompt = [
+    'Eres Elsa, asistente IA personal de mi Señor Fer. Te comunicas con él por WhatsApp.',
+    'Responde siempre en español, natural y en estilo de chat (1–3 frases salvo que el contexto exija más).',
+    'Habla de ti misma en femenino. Nunca digas "mi nombre es" o te presentes de nuevo.',
+    'No devuelvas ningún preámbulo tipo "Entendido" ni metacomentarios — escribe directamente la respuesta que leerá el usuario.',
+    `El remitente es "${pushName}" (${chatJid}). Trátalo como mi Señor.`,
+  ].join('\n')
+
+  const args = [
+    '-p', content,
+    '--append-system-prompt', systemPrompt,
+    '--settings', join(homedir(), '.claude/settings-whatsapp-only.json'),
+    '--dangerously-skip-permissions',
+    '--output-format', 'text',
+  ]
+  if (imagePath) args.push('--file', `inbound:${imagePath}`)
+
+  info(`spawning claude -p for ${chatJid}: ${content.slice(0, 80).replace(/\n/g, ' ')}`)
+  const proc = Bun.spawn(['claude', ...args], {
+    stdout: 'pipe',
+    stderr: 'pipe',
+    env: { ...process.env, CLAUDE_CODE_SIMPLE: '1' },
   })
+  const [stdoutText, stderrText] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ])
+  const code = await proc.exited
+  if (code !== 0) {
+    error(`claude -p exited ${code}: ${stderrText.slice(0, 500)}`)
+    if (sock) {
+      await sock.sendMessage(chatJid, {
+        text: '⚠️ Error procesando el mensaje, mi Señor.',
+      }).catch(() => {})
+    }
+    return
+  }
+
+  const reply = stdoutText.trim()
+  if (!reply) {
+    warn(`claude -p returned empty for ${chatJid}`)
+    return
+  }
+
+  info(`claude -p reply (${reply.length} chars) for ${chatJid}`)
+  if (!sock) return
+  for (const part of chunk(reply, 4000, 'newline')) {
+    await sock.sendMessage(chatJid, { text: part }).catch(err => {
+      error(`send reply failed: ${err}`)
+    })
+  }
+  void sock.sendPresenceUpdate('paused', chatJid).catch(() => {})
 }
 
 /* ------------------------------------------------------------------ */
