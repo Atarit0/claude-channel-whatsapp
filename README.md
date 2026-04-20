@@ -1,4 +1,4 @@
-# claude-channel-whatsapp · fork de Elsa
+# claude-channel-whatsapp
 
 Fork personal del plugin [PenguinMiaou/claude-channel-whatsapp](https://github.com/PenguinMiaou/claude-channel-whatsapp), modificado para alimentar a el asistente, con todo lo que llega por WhatsApp.
 
