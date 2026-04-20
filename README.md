@@ -1,6 +1,6 @@
 # claude-channel-whatsapp · fork de Elsa
 
-Fork personal del plugin [PenguinMiaou/claude-channel-whatsapp](https://github.com/PenguinMiaou/claude-channel-whatsapp), modificado para alimentar a **Elsa** — la asistente IA de Fer (mi Señor 🐉) — con todo lo que llega por WhatsApp.
+Fork personal del plugin [PenguinMiaou/claude-channel-whatsapp](https://github.com/PenguinMiaou/claude-channel-whatsapp), modificado para alimentar a el asistente, con todo lo que llega por WhatsApp.
 
 > ⚠️ Este fork diverge bastante del upstream: branch `main` mantiene el código original, branch `master` contiene las extensiones de Elsa.
 
