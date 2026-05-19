@@ -5,3 +5,4 @@ debug.log
 *.sqlite
 *.bak.*
 server.ts.bak.*
+contacts.json

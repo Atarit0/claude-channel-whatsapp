@@ -147,6 +147,49 @@ let unexpectedAccount = false
 let pairedJid: string | null = null
 
 /* ------------------------------------------------------------------ */
+/*  Contact map — persists JID→pushName for group participants         */
+/* ------------------------------------------------------------------ */
+
+const CONTACTS_FILE = join(homedir(), '.claude/plugins/claude-whatsapp/contacts.json')
+
+function loadContacts(): Record<string, string> {
+  try {
+    if (existsSync(CONTACTS_FILE)) {
+      return JSON.parse(readFileSync(CONTACTS_FILE, 'utf8')) as Record<string, string>
+    }
+  } catch {}
+  return {}
+}
+
+function saveContacts(contacts: Record<string, string>): void {
+  try {
+    const tmp = CONTACTS_FILE + '.tmp'
+    writeFileSync(tmp, JSON.stringify(contacts, null, 2) + '\n', { mode: 0o600 })
+    renameSync(tmp, CONTACTS_FILE)
+  } catch (err) {
+    error(`contacts save failed: ${err}`)
+  }
+}
+
+const contactMap: Record<string, string> = loadContacts()
+
+/** Update contact map if pushName is non-empty and differs from current */
+function upsertContact(jid: string, pushName: string | null | undefined): void {
+  if (!pushName || !jid) return
+  const bare = jid.split('@')[0]  // normalize: store bare number
+  if (contactMap[bare] !== pushName) {
+    contactMap[bare] = pushName
+    saveContacts(contactMap)
+  }
+}
+
+/** Resolve a JID to a human name via contact map, fallback to phone number */
+function resolveContactName(jid: string): string {
+  const bare = jid.split('@')[0].split(':')[0]
+  return contactMap[bare] || bare
+}
+
+/* ------------------------------------------------------------------ */
 /*  Safety nets                                                       */
 /* ------------------------------------------------------------------ */
 
@@ -880,6 +923,18 @@ async function handleInboundMessage(msg: proto.IWebMessageInfo): Promise<void> {
     case 'stickerMessage': {
       text = '(sticker)'
       attachmentMeta = { attachment_kind: 'sticker', attachment_message_id: msgId }
+      try {
+        const buffer = await downloadMediaMessage(msg, 'buffer', {}, {
+          logger: makeSilentLogger(),
+          reuploadRequest: sock!.updateMediaMessage,
+        })
+        const stickerPath = join(INBOX_DIR, `${Date.now()}-${msgId}.webp`)
+        writeFileSync(stickerPath, buffer as Buffer)
+        imagePath = stickerPath
+        log(`attach sticker received (${(buffer as Buffer).length} bytes) saved to ${stickerPath}`)
+      } catch (err) {
+        error(`sticker download failed: ${err}`)
+      }
       break
     }
     case 'locationMessage': {
@@ -899,6 +954,36 @@ async function handleInboundMessage(msg: proto.IWebMessageInfo): Promise<void> {
 
   const phone   = jidToPhone(senderJid)
   const pushName = msg.pushName || phone
+
+  // Update contact map with sender info
+  upsertContact(senderJid, msg.pushName)
+
+  // Extract quoted message context (reply)
+  const contextInfo = inner.extendedTextMessage?.contextInfo
+    ?? inner.imageMessage?.contextInfo
+    ?? inner.audioMessage?.contextInfo
+    ?? inner.videoMessage?.contextInfo
+    ?? inner.documentMessage?.contextInfo
+
+  let quotedBlock: string | undefined
+  if (contextInfo?.quotedMessage) {
+    const qm = contextInfo.quotedMessage
+    const quotedText = qm.conversation
+      || qm.extendedTextMessage?.text
+      || qm.imageMessage?.caption
+      || qm.videoMessage?.caption
+      || qm.documentMessage?.caption
+      || (qm.audioMessage?.ptt ? '(nota de voz)' : undefined)
+      || '(mensaje multimedia)'
+    const quotedParticipantJid = contextInfo.participant || ''
+    const quotedAuthor = quotedParticipantJid
+      ? resolveContactName(quotedParticipantJid)
+      : 'desconocido'
+    if (quotedText) {
+      quotedBlock = `[En respuesta a "${String(quotedText).slice(0, 200)}" de ${quotedAuthor}]`
+    }
+  }
+
   const ts = msg.messageTimestamp
     ? new Date(Number(msg.messageTimestamp) * 1000).toISOString()
     : new Date().toISOString()
@@ -929,7 +1014,7 @@ async function handleInboundMessage(msg: proto.IWebMessageInfo): Promise<void> {
   // If user sent voice, reply with voice too (mirror modality).
   const wasVoice = innerType === 'audioMessage' && !!inner.audioMessage?.ptt
   enqueueChatTurn(chatJid, () =>
-    respondViaClaude(chatJid, text, pushName, imagePath, wasVoice),
+    respondViaClaude(chatJid, text, pushName, senderJid, imagePath, wasVoice, quotedBlock),
   ).catch(err => error(`respondViaClaude failed: ${err}`))
 }
 
@@ -1005,8 +1090,59 @@ async function computeWaveform(srcPath: string): Promise<{ waveform: Uint8Array;
   return { waveform: wave, seconds }
 }
 
-async function synthesizeVoiceNote(text: string, outPath: string): Promise<{ waveform?: Uint8Array; seconds?: number } | null> {
-  const mp3 = outPath.replace(/\.ogg$/, '') + '.mp3'
+const ELEVEN_API_KEY = process.env.ELEVENLABS_API_KEY ?? 'sk_baaf8d744aa6e2054cc74446006793ed844edd7eff49bc16'
+const ELEVEN_VOICE_ID = process.env.ELEVENLABS_VOICE_ID ?? 'KDG2CWzkFgcZz4Vqbu8m'
+const ELEVEN_MODEL = process.env.ELEVENLABS_MODEL ?? 'eleven_turbo_v2_5'
+
+const ELEVEN_MAX_ATTEMPTS = Number(process.env.ELEVENLABS_MAX_ATTEMPTS ?? 3)
+const ELEVEN_BASE_DELAY_MS = Number(process.env.ELEVENLABS_BASE_DELAY_MS ?? 800)
+
+async function synthesizeWithElevenLabs(text: string, mp3: string): Promise<boolean> {
+  let lastDetail = ''
+  for (let attempt = 1; attempt <= ELEVEN_MAX_ATTEMPTS; attempt++) {
+    let retriable = false
+    try {
+      const resp = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`, {
+        method: 'POST',
+        headers: { 'xi-api-key': ELEVEN_API_KEY, 'Content-Type': 'application/json', 'Accept': 'audio/mpeg' },
+        body: JSON.stringify({
+          text,
+          model_id: ELEVEN_MODEL,
+          voice_settings: { stability: 0.5, similarity_boost: 0.75 },
+        }),
+      })
+      if (resp.ok) {
+        const buf = Buffer.from(await resp.arrayBuffer())
+        if (buf.length < 256) {
+          lastDetail = `suspicious payload (${buf.length} bytes)`
+          retriable = true
+        } else {
+          await Bun.write(mp3, buf)
+          info(`elevenlabs ok on attempt ${attempt} (${buf.length} bytes)`)
+          return true
+        }
+      } else {
+        const body = await resp.text()
+        lastDetail = `${resp.status} ${body.slice(0, 200)}`
+        // Retry on 429 (rate limit) and 5xx (transient). 4xx auth/quota stays terminal.
+        retriable = resp.status === 429 || resp.status >= 500
+      }
+    } catch (e) {
+      lastDetail = String(e)
+      retriable = true
+    }
+    if (!retriable || attempt === ELEVEN_MAX_ATTEMPTS) {
+      error(`elevenlabs failed after ${attempt} attempt(s): ${lastDetail}`)
+      return false
+    }
+    const backoff = ELEVEN_BASE_DELAY_MS * Math.pow(2, attempt - 1)
+    error(`elevenlabs attempt ${attempt} failed (${lastDetail}); retry in ${backoff}ms`)
+    await new Promise((r) => setTimeout(r, backoff))
+  }
+  return false
+}
+
+async function synthesizeWithEdgeTts(text: string, mp3: string): Promise<boolean> {
   const tts = Bun.spawn(
     ['edge-tts', '--voice', 'es-ES-XimenaNeural', '--rate=-7%', '--text', text, '--write-media', mp3],
     { stdout: 'pipe', stderr: 'pipe' },
@@ -1015,8 +1151,15 @@ async function synthesizeVoiceNote(text: string, outPath: string): Promise<{ wav
   const ttsCode = await tts.exited
   if (ttsCode !== 0) {
     error(`edge-tts exited ${ttsCode}: ${ttsStderr.slice(0, 300)}`)
-    return null
+    return false
   }
+  return true
+}
+
+async function synthesizeVoiceNote(text: string, outPath: string): Promise<{ waveform?: Uint8Array; seconds?: number } | null> {
+  const mp3 = outPath.replace(/\.ogg$/, '') + '.mp3'
+  const ok = (await synthesizeWithElevenLabs(text, mp3)) || (await synthesizeWithEdgeTts(text, mp3))
+  if (!ok) return null
   const ff = Bun.spawn(
     ['ffmpeg', '-y', '-loglevel', 'error', '-i', mp3, '-ac', '1', '-ar', '48000', '-c:a', 'libopus', '-b:a', '48k', '-application', 'voip', outPath],
     { stdout: 'pipe', stderr: 'pipe' },
@@ -1188,9 +1331,21 @@ async function respondViaClaude(
   chatJid: string,
   content: string,
   pushName: string,
+  senderJid: string,
   imagePath: string | undefined,
   replyAsVoice: boolean,
+  quotedBlock?: string,
 ): Promise<void> {
+  // Determine if sender is the bot owner (mi Señor)
+  const ownerJid = pairedJid || EXPECTED_JID
+  const senderBare = senderJid.split('@')[0].split(':')[0]
+  const ownerBare  = ownerJid.split('@')[0].split(':')[0]
+  const isOwner    = senderBare === ownerBare
+
+  const senderLine = isOwner
+    ? `El remitente es "${pushName}" (JID participant: ${senderJid}). Es mi Señor — trátalo como tal.`
+    : `El remitente es "${pushName}" (JID participant: ${senderJid}). NO es mi Señor — es un participante del grupo. Trátalo con cortesía pero no como Señor. El owner del bot es ${ownerJid}.`
+
   const systemPrompt = [
     'Eres Elsa, asistente IA personal de mi Señor Fer. Te comunicas con él por WhatsApp.',
     'Responde siempre en español, natural y en estilo de chat (1–3 frases salvo que el contexto exija más).',
@@ -1199,13 +1354,18 @@ async function respondViaClaude(
     'Para adjuntar ficheros locales, escribe en una línea propia `[[ATTACH:/ruta/absoluta|modo]]`. Modos: voice, audio, image, doc. Si omites el modo se infiere por extensión. Estas líneas se eliminan del texto antes de enviar.',
     'Para reaccionar al último mensaje del usuario con un emoji, escribe en su propia línea `[[REACT:<emoji>]]` (ej. `[[REACT:😂]]`). Úsalo SOLO cuando sea natural: una carcajada a un chiste, un 👍 a una buena idea, un ❤️ puntual. NO reacciones por defecto ni en cada mensaje — mejor callarte que parecer pesada. La línea se elimina del texto antes de enviar.',
     'Si el usuario te envía una nota de voz pero te pide explícitamente respuesta por texto ("mándame por texto", "en texto", etc.), escribe `[[TEXT_REPLY]]` en una línea propia. Por defecto, cuando entra voz se responde con voz (mirror modality); este sigil anula ese automatismo para ese turno. La línea se elimina del texto antes de enviar.',
-    `El remitente es "${pushName}" (${chatJid}). Trátalo como mi Señor.`,
+    senderLine,
     ...(chatJid.endsWith('@g.us') ? ['Estás en un GRUPO, no en DM. Participa con naturalidad cuando tengas algo concreto que aportar (dato útil, corrección, broma oportuna, respuesta a algo que te mencione directamente). Si el mensaje no requiere tu intervención, responde con cadena vacía — sin disculpas, sin comentarios meta, solo silencio. No seas pesada ni comentes cada cosa.'] : []),
   ].join('\n')
 
+  const isSticker = content === '(sticker)'
+  // Prepend quoted context block if present
+  const contentWithQuote = quotedBlock ? `${quotedBlock}\n\n${content}` : content
   const promptBody = imagePath
-    ? `El usuario te envió una imagen en ${imagePath}. Lee la imagen con la tool Read y responde a su consulta.\n\nTexto acompañante: ${content}`
-    : content
+    ? isSticker
+      ? `El usuario te envió un sticker (WebP) en ${imagePath}. Léelo con la tool Read y responde con gracia o comentario apropiado.\n\nTexto acompañante: ${contentWithQuote}`
+      : `El usuario te envió una imagen en ${imagePath}. Lee la imagen con la tool Read y responde a su consulta.\n\nTexto acompañante: ${contentWithQuote}`
+    : contentWithQuote
 
   /* DASH_PROMPT_STDIN_V1 */
   const baseArgs = [
@@ -1249,7 +1409,7 @@ async function respondViaClaude(
   info(
     `spawning claude -p for ${chatJid} ` +
     `(${isNewSession ? 'new' : 'resume'} session=${sessionId.slice(0, 8)}): ` +
-    `${content.slice(0, 80).replace(/\n/g, ' ')}`,
+    `${content.replace(/\n/g, ' ')}`,
   )
   let { code, stdout: stdoutText, stderr: stderrText } = await runClaude([...sessionArgs, ...baseArgs], promptBody)
 
@@ -1285,7 +1445,7 @@ async function respondViaClaude(
   const { text: afterReact, reactions } = parseReactions(afterAttach)
   const { text: reply, textReply } = parseTextReplyFlag(afterReact)
   if (textReply) replyAsVoice = false
-  info(`claude -p reply (${raw.length} chars, ${attachments.length} attach, ${reactions.length} react${textReply ? ', text-reply-forced' : ''}) for ${chatJid} session=${sessionId.slice(0, 8)}`)
+  info(`claude -p reply (${raw.length} chars, ${attachments.length} attach, ${reactions.length} react${textReply ? ', text-reply-forced' : ''}) for ${chatJid} session=${sessionId.slice(0, 8)}: ${reply.replace(/\n/g, ' ')}`)
   if (!sock) return
 
   for (const emoji of reactions) {
