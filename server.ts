@@ -18,7 +18,7 @@
  *   - QR rendered as ASCII in stdout AND as PNG (~480px) in state dir
  *   - MCP tool `get_pairing_state` for /whatsapp:configure skill
  *   - Force QR regeneration via disconnect+reconnect when TTL expired
- *   - Number validation: expected JID 634567501@s.whatsapp.net
+ *   - Number validation: expected JID 34635864501@s.whatsapp.net
  *     If pairing completes with a different number → WARNING + unexpected_account flag
  *
  * MCP tool names follow the same pattern as the official Telegram plugin:
@@ -139,7 +139,7 @@ function clearSessionId(chatJid: string): void {
 /*  Expected account validation                                       */
 /* ------------------------------------------------------------------ */
 
-const EXPECTED_PHONE = '34634567501'
+const EXPECTED_PHONE = '34635864501'
 const EXPECTED_JID   = EXPECTED_PHONE + '@s.whatsapp.net'
 
 /** Set to true if pairing completed with an unexpected JID */
@@ -944,6 +944,18 @@ async function handleInboundMessage(msg: proto.IWebMessageInfo): Promise<void> {
     }
     case 'contactMessage': {
       text = `(contact: ${inner.contactMessage?.displayName || 'unknown'})`
+      break
+    }
+    case 'reactionMessage': {
+      const emoji = inner.reactionMessage?.text || ''
+      const targetId = inner.reactionMessage?.key?.id || ''
+      if (!emoji) {
+        info(`reaction removed (target=${targetId})`)
+        return
+      }
+      info(`reaction received: ${emoji} on ${targetId}`)
+      text = `(El usuario reaccionó ${emoji} a tu mensaje anterior. Si la reacción es solo expresiva (risa, aprobación, ❤️, lloro) y no exige respuesta, contesta con cadena vacía para guardar silencio. Responde únicamente si la reacción pide algo concreto — ej. ❌/👎 sobre una propuesta, 🤔 sobre un dato dudoso, 😡 sobre algo a corregir.)`
+      attachmentMeta = { attachment_kind: 'reaction', reaction_emoji: emoji, attachment_message_id: msgId }
       break
     }
     default:
