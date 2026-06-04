@@ -139,8 +139,13 @@ function clearSessionId(chatJid: string): void {
 /*  Expected account validation                                       */
 /* ------------------------------------------------------------------ */
 
-const EXPECTED_PHONE = '34635864501'
+const EXPECTED_PHONE = '34634567501'  // cuenta Baileys (Elsa)
 const EXPECTED_JID   = EXPECTED_PHONE + '@s.whatsapp.net'
+/* OWNER_VS_BOT_SPLIT_V1 */
+const OWNER_PHONE    = '34635864501'  // mi Señor Fer
+const OWNER_JID      = OWNER_PHONE + '@s.whatsapp.net'
+/* OWNER_LID_FALLBACK_V1 */
+const OWNER_LID      = '78550824648715'  // LID Fer en grupos (jidless)
 
 /** Set to true if pairing completed with an unexpected JID */
 let unexpectedAccount = false
@@ -187,6 +192,31 @@ function upsertContact(jid: string, pushName: string | null | undefined): void {
 function resolveContactName(jid: string): string {
   const bare = jid.split('@')[0].split(':')[0]
   return contactMap[bare] || bare
+}
+
+/* ------------------------------------------------------------------ */
+/*  Alias map — manual JID→preferred name overrides (priority over    */
+/*  pushName). Lets Fer call participants by their human name even if */
+/*  their WhatsApp pushName is a gamer tag / nickname.                */
+/* ------------------------------------------------------------------ */
+
+const ALIASES_FILE = join(homedir(), '.claude/plugins/claude-whatsapp/aliases.json')
+
+function loadAliases(): Record<string, string> {
+  try {
+    if (existsSync(ALIASES_FILE)) {
+      return JSON.parse(readFileSync(ALIASES_FILE, 'utf8')) as Record<string, string>
+    }
+  } catch {}
+  return {}
+}
+
+const aliasMap: Record<string, string> = loadAliases()
+
+/** Return preferred display name: alias if present, else pushName, else bare */
+function resolveDisplayName(jid: string, pushName: string): string {
+  const bare = jid.split('@')[0].split(':')[0]
+  return aliasMap[bare] || pushName || bare
 }
 
 /* ------------------------------------------------------------------ */
@@ -575,12 +605,49 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
 /* ------------------------------------------------------------------ */
 
 const DEDUPE_MAX = 500
-const seenMessageIds: string[] = []  // ordered list for LRU eviction
+const seenMessageIds = new Set<string>()         // O(1) lookup
+const seenMessageOrder: string[] = []            // LRU eviction order
 
 function isDuplicate(id: string): boolean {
-  if (seenMessageIds.includes(id)) return true
-  seenMessageIds.push(id)
-  if (seenMessageIds.length > DEDUPE_MAX) seenMessageIds.shift()
+  if (seenMessageIds.has(id)) return true
+  seenMessageIds.add(id)
+  seenMessageOrder.push(id)
+  if (seenMessageOrder.length > DEDUPE_MAX) {
+    const oldest = seenMessageOrder.shift()
+    if (oldest) seenMessageIds.delete(oldest)
+  }
+  return false
+}
+
+/* CONTENT_SIG_DEDUP_V1: secondary defense — Baileys occasionally re-emits
+   the same logical message with a different key.id (history sync replays,
+   multi-device echoes). ID dedup misses those. Hash chat+sender+text+ts
+   over a 30s window and drop content-duplicates. */
+const CONTENT_DEDUP_TTL_MS = 30_000
+const seenContentSignatures = new Map<string, number>()
+
+function contentSignature(msg: import('@whiskeysockets/baileys').proto.IWebMessageInfo): string {
+  const chat   = msg.key?.remoteJid || ''
+  const sender = msg.key?.participant || chat
+  const ts     = msg.messageTimestamp ? Number(msg.messageTimestamp) : 0
+  const inner  = msg.message?.conversation
+              || msg.message?.extendedTextMessage?.text
+              || (msg.message ? Object.keys(msg.message).join(',') : '')
+  return `${chat}|${sender}|${ts}|${inner.slice(0, 120)}`
+}
+
+function isContentDuplicate(msg: import('@whiskeysockets/baileys').proto.IWebMessageInfo): boolean {
+  const now = Date.now()
+  // Garbage-collect expired entries (cheap: rare, bounded)
+  if (seenContentSignatures.size > 50) {
+    for (const [k, t] of seenContentSignatures) {
+      if (now - t > CONTENT_DEDUP_TTL_MS) seenContentSignatures.delete(k)
+    }
+  }
+  const sig = contentSignature(msg)
+  const prev = seenContentSignatures.get(sig)
+  if (prev !== undefined && now - prev < CONTENT_DEDUP_TTL_MS) return true
+  seenContentSignatures.set(sig, now)
   return false
 }
 
@@ -795,9 +862,28 @@ async function handleInboundMessage(msg: proto.IWebMessageInfo): Promise<void> {
 
   const msgId = msg.key.id || ''
 
+  // FIX_DEDUP_NULL_ID_V1: if the message has no key.id (happens with some
+  // Baileys retransmissions / history sync replays / multi-device echoes),
+  // we cannot dedupe it reliably. Earlier code skipped the dedup check
+  // entirely in that case (`if (msgId && ...)`) and stored under key ''
+  // which collided across all such messages, causing phantom rebotes.
+  // Reject messages without a stable ID outright — they are almost
+  // always replays of something we already handled.
+  if (!msgId) {
+    info(`drop: inbound message without key.id (likely replay) chat=${msg.key.remoteJid}`)
+    return
+  }
+
   // Deduplication: skip replayed messages on reconnect
-  if (msgId && isDuplicate(msgId)) {
+  if (isDuplicate(msgId)) {
     info(`dedup: skipping already-seen message ${msgId}`)
+    return
+  }
+
+  // Secondary defense: same content with different key.id (history sync,
+  // multi-device echo). Catches phantom rebotes that ID-based dedup misses.
+  if (isContentDuplicate(msg)) {
+    info(`content-dedup: skipping duplicate-content message ${msgId} chat=${msg.key.remoteJid}`)
     return
   }
 
@@ -830,6 +916,7 @@ async function handleInboundMessage(msg: proto.IWebMessageInfo): Promise<void> {
   const messageContent = msg.message
   let text = ''
   let imagePath: string | undefined
+  let documentPath: string | undefined
   let attachmentMeta: Record<string, string> | undefined
 
   const inner = messageContent?.ephemeralMessage?.message
@@ -874,6 +961,27 @@ async function handleInboundMessage(msg: proto.IWebMessageInfo): Promise<void> {
         attachment_name: fileName,
         attachment_mime: doc?.mimetype || 'application/octet-stream',
         attachment_message_id: msgId,
+      }
+      try {
+        const buffer = await downloadMediaMessage(msg, 'buffer', {}, {
+          logger: makeSilentLogger(),
+          reuploadRequest: sock!.updateMediaMessage,
+        })
+        // Sanitize fileName: strip directory parts and any character that
+        // isn't word/dot/dash/plus to block path traversal and weird shell
+        // escaping downstream. Keep the original name visible after the
+        // timestamp+msgId prefix so the assistant can refer to it naturally.
+        const safeName = fileName
+          .replace(/[\/\\]/g, '_')
+          .replace(/[^\w.\-+]/g, '_')
+          .slice(0, 80) || 'document'
+        const path = join(INBOX_DIR, `${Date.now()}-${msgId}-${safeName}`)
+        writeFileSync(path, buffer as Buffer)
+        attachmentMeta.attachment_path = path
+        documentPath = path
+        info(`document saved to ${path} (${(buffer as Buffer).length} bytes, ${doc?.mimetype || '?'})`)
+      } catch (err) {
+        error(`document download failed: ${err}`)
       }
       break
     }
@@ -1026,7 +1134,7 @@ async function handleInboundMessage(msg: proto.IWebMessageInfo): Promise<void> {
   // If user sent voice, reply with voice too (mirror modality).
   const wasVoice = innerType === 'audioMessage' && !!inner.audioMessage?.ptt
   enqueueChatTurn(chatJid, () =>
-    respondViaClaude(chatJid, text, pushName, senderJid, imagePath, wasVoice, quotedBlock),
+    respondViaClaude(chatJid, text, pushName, senderJid, imagePath, wasVoice, quotedBlock, documentPath),
   ).catch(err => error(`respondViaClaude failed: ${err}`))
 }
 
@@ -1103,7 +1211,8 @@ async function computeWaveform(srcPath: string): Promise<{ waveform: Uint8Array;
 }
 
 const ELEVEN_API_KEY = process.env.ELEVENLABS_API_KEY ?? 'sk_baaf8d744aa6e2054cc74446006793ed844edd7eff49bc16'
-const ELEVEN_VOICE_ID = process.env.ELEVENLABS_VOICE_ID ?? 'KDG2CWzkFgcZz4Vqbu8m'
+/* CRISTINA_DEFAULT_V1 */
+const ELEVEN_VOICE_ID = process.env.ELEVENLABS_VOICE_ID ?? 'dNjJKg63Fr5AXwIdkATa'
 const ELEVEN_MODEL = process.env.ELEVENLABS_MODEL ?? 'eleven_turbo_v2_5'
 
 const ELEVEN_MAX_ATTEMPTS = Number(process.env.ELEVENLABS_MAX_ATTEMPTS ?? 3)
@@ -1347,12 +1456,14 @@ async function respondViaClaude(
   imagePath: string | undefined,
   replyAsVoice: boolean,
   quotedBlock?: string,
+  documentPath?: string,
 ): Promise<void> {
   // Determine if sender is the bot owner (mi Señor)
-  const ownerJid = pairedJid || EXPECTED_JID
+  /* OWNER_VS_BOT_SPLIT_V1 + OWNER_LID_FALLBACK_V1 */
+  const ownerJid = OWNER_JID
   const senderBare = senderJid.split('@')[0].split(':')[0]
-  const ownerBare  = ownerJid.split('@')[0].split(':')[0]
-  const isOwner    = senderBare === ownerBare
+  const ownerBare  = OWNER_PHONE
+  const isOwner    = senderBare === OWNER_PHONE || senderBare === OWNER_LID
 
   const senderLine = isOwner
     ? `El remitente es "${pushName}" (JID participant: ${senderJid}). Es mi Señor — trátalo como tal.`
@@ -1366,18 +1477,31 @@ async function respondViaClaude(
     'Para adjuntar ficheros locales, escribe en una línea propia `[[ATTACH:/ruta/absoluta|modo]]`. Modos: voice, audio, image, doc. Si omites el modo se infiere por extensión. Estas líneas se eliminan del texto antes de enviar.',
     'Para reaccionar al último mensaje del usuario con un emoji, escribe en su propia línea `[[REACT:<emoji>]]` (ej. `[[REACT:😂]]`). Úsalo SOLO cuando sea natural: una carcajada a un chiste, un 👍 a una buena idea, un ❤️ puntual. NO reacciones por defecto ni en cada mensaje — mejor callarte que parecer pesada. La línea se elimina del texto antes de enviar.',
     'Si el usuario te envía una nota de voz pero te pide explícitamente respuesta por texto ("mándame por texto", "en texto", etc.), escribe `[[TEXT_REPLY]]` en una línea propia. Por defecto, cuando entra voz se responde con voz (mirror modality); este sigil anula ese automatismo para ese turno. La línea se elimina del texto antes de enviar.',
+    /* NO_AUTORESTART_GUARD_V1 */
+    'NUNCA reinicies el servicio claude-whatsapp.service ni el plugin de WhatsApp por tu cuenta. Si crees que algo está mal en el plugin, dilo en la respuesta y déjalo así — el Señor decidirá si reinicia.',
     senderLine,
     ...(chatJid.endsWith('@g.us') ? ['Estás en un GRUPO, no en DM. Participa con naturalidad cuando tengas algo concreto que aportar (dato útil, corrección, broma oportuna, respuesta a algo que te mencione directamente). Si el mensaje no requiere tu intervención, responde con cadena vacía — sin disculpas, sin comentarios meta, solo silencio. No seas pesada ni comentes cada cosa.'] : []),
   ].join('\n')
 
   const isSticker = content === '(sticker)'
+  // GROUP_SPEAKER_PREFIX_V1: in groups, prefix the message with the speaker's
+  // display name (alias overrides pushName) so subsequent turns can
+  // distinguish who said what across the conversation history (the system
+  // prompt only carries the current sender).
+  const isGroupChat = chatJid.endsWith('@g.us')
+  const displayName = resolveDisplayName(senderJid, pushName)
+  const speakerPrefix = isGroupChat ? `[${displayName}] ` : ''
   // Prepend quoted context block if present
-  const contentWithQuote = quotedBlock ? `${quotedBlock}\n\n${content}` : content
+  const contentWithQuote = quotedBlock
+    ? `${quotedBlock}\n\n${speakerPrefix}${content}`
+    : `${speakerPrefix}${content}`
   const promptBody = imagePath
     ? isSticker
       ? `El usuario te envió un sticker (WebP) en ${imagePath}. Léelo con la tool Read y responde con gracia o comentario apropiado.\n\nTexto acompañante: ${contentWithQuote}`
       : `El usuario te envió una imagen en ${imagePath}. Lee la imagen con la tool Read y responde a su consulta.\n\nTexto acompañante: ${contentWithQuote}`
-    : contentWithQuote
+    : documentPath
+      ? `El usuario te envió un documento en ${documentPath}. Léelo con la tool Read (si es PDF largo usa el parámetro pages) y responde a su consulta.\n\nTexto acompañante: ${contentWithQuote}`
+      : contentWithQuote
 
   /* DASH_PROMPT_STDIN_V1 */
   const baseArgs = [
@@ -1447,7 +1571,16 @@ async function respondViaClaude(
 
   if (isNewSession) setSessionId(chatJid, sessionId)
 
-  const raw = stdoutText.trim()
+  // STRIP_SDK_ROLE_HEADERS_V2: occasionally the model leaks SDK role markers
+  // ("Human: ...", "Assistant: ...") AND speaker prefixes the plugin itself
+  // injects in group chats ("[Ferran] ...", "[Susana] ..."). Both should
+  // never appear in the model's actual reply — they're context formatting,
+  // not content. Strip them all defensively so phantom rebotes don't reach
+  // the recipient or get re-echoed back into the chat.
+  const raw = stdoutText
+    .replace(/^[ \t]*(?:Human|Assistant):[ \t]*/gm, '')
+    .replace(/^[ \t]*\[[^\]\n]{1,40}\][ \t]+/gm, '')
+    .trim()
   if (!raw) {
     warn(`claude -p returned empty for ${chatJid}`)
     return

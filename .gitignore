@@ -4,5 +4,8 @@ bun.lockb
 debug.log
 *.sqlite
 *.bak.*
+*.bak-*
 server.ts.bak.*
+server.ts.bak-*
 contacts.json
+aliases.json
