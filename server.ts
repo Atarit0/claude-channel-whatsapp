@@ -1005,8 +1005,9 @@ async function handleInboundMessage(msg: proto.IWebMessageInfo): Promise<void> {
         attachmentMeta.attachment_path = path
         info(`audio saved to ${path} (${(buffer as Buffer).length} bytes)`)
 
-        // Transcribe with local Vosk (es model by default).
-        const transcript = await transcribeVosk(path, 'es')
+        // Transcribe using the configured STT backend (Vosk local by
+        // default, ElevenLabs Scribe if WHATSAPP_STT_BACKEND=elevenlabs).
+        const transcript = await transcribeAudio(path, 'es')
         if (transcript) {
           text = transcript
           attachmentMeta.transcript = transcript
@@ -1177,6 +1178,47 @@ async function transcribeVosk(audioPath: string, lang: 'es' | 'ca' = 'es'): Prom
     return ''
   }
   return stdoutText.trim()
+}
+
+/* STT_BACKEND_SCRIBE_V1: ElevenLabs Scribe (cloud) as an opt-in alternative
+   to local Vosk. Higher accuracy on noisy / fast / colloquial speech, but
+   consumes characters from the same ElevenLabs plan as TTS. Falls back to
+   Vosk on any error so a Scribe outage never silences inbound voice. */
+async function transcribeElevenLabs(audioPath: string, lang: 'es' | 'ca' = 'es'): Promise<string> {
+  const buffer = readFileSync(audioPath)
+  const fileName = audioPath.split('/').pop() || 'audio.ogg'
+  const form = new FormData()
+  form.append('file', new Blob([buffer], { type: 'audio/ogg' }), fileName)
+  form.append('model_id', 'scribe_v1')
+  form.append('language_code', lang === 'ca' ? 'cat' : 'spa')
+  const resp = await fetch('https://api.elevenlabs.io/v1/speech-to-text', {
+    method: 'POST',
+    headers: { 'xi-api-key': ELEVEN_API_KEY },
+    body: form,
+  })
+  if (!resp.ok) {
+    const errText = await resp.text().catch(() => '')
+    throw new Error(`scribe ${resp.status}: ${errText.slice(0, 200)}`)
+  }
+  const json = await resp.json() as { text?: string }
+  return (json.text || '').trim()
+}
+
+const STT_BACKEND = (process.env.WHATSAPP_STT_BACKEND || 'vosk').toLowerCase()
+info(`STT backend: ${STT_BACKEND === 'elevenlabs' || STT_BACKEND === 'scribe' ? 'ElevenLabs Scribe (cloud) → Vosk fallback' : 'Vosk (local)'}`)
+
+async function transcribeAudio(audioPath: string, lang: 'es' | 'ca' = 'es'): Promise<string> {
+  if (STT_BACKEND === 'elevenlabs' || STT_BACKEND === 'scribe') {
+    try {
+      const t = await transcribeElevenLabs(audioPath, lang)
+      if (t) return t
+      info('scribe returned empty transcript, falling back to vosk')
+    } catch (err) {
+      error(`scribe transcribe failed, falling back to vosk: ${err}`)
+    }
+    return transcribeVosk(audioPath, lang)
+  }
+  return transcribeVosk(audioPath, lang)
 }
 
 async function computeWaveform(srcPath: string): Promise<{ waveform: Uint8Array; seconds: number } | null> {
