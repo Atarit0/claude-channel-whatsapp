@@ -917,6 +917,7 @@ async function handleInboundMessage(msg: proto.IWebMessageInfo): Promise<void> {
   let text = ''
   let imagePath: string | undefined
   let documentPath: string | undefined
+  let videoPath: string | undefined
   let attachmentMeta: Record<string, string> | undefined
 
   const inner = messageContent?.ephemeralMessage?.message
@@ -1021,11 +1022,26 @@ async function handleInboundMessage(msg: proto.IWebMessageInfo): Promise<void> {
       break
     }
     case 'videoMessage': {
-      text = inner.videoMessage?.caption || '(video)'
+      const isGif = !!inner.videoMessage?.gifPlayback
+      text = inner.videoMessage?.caption || (isGif ? '(gif)' : '(video)')
       attachmentMeta = {
-        attachment_kind: 'video',
+        attachment_kind: isGif ? 'gif' : 'video',
         attachment_mime: inner.videoMessage?.mimetype || 'video/mp4',
         attachment_message_id: msgId,
+      }
+      try {
+        const buffer = await downloadMediaMessage(msg, 'buffer', {}, {
+          logger: makeSilentLogger(),
+          reuploadRequest: sock!.updateMediaMessage,
+        })
+        const ext = (inner.videoMessage?.mimetype?.split('/')?.[1] || 'mp4').split(';')[0]
+        const path = join(INBOX_DIR, `${Date.now()}-${msgId}.${ext}`)
+        writeFileSync(path, buffer as Buffer)
+        attachmentMeta.attachment_path = path
+        videoPath = path
+        info(`${isGif ? 'gif' : 'video'} saved to ${path} (${(buffer as Buffer).length} bytes)`)
+      } catch (err) {
+        error(`video download failed: ${err}`)
       }
       break
     }
@@ -1051,8 +1067,92 @@ async function handleInboundMessage(msg: proto.IWebMessageInfo): Promise<void> {
       text = `(location: ${loc?.degreesLatitude}, ${loc?.degreesLongitude})`
       break
     }
-    case 'contactMessage': {
-      text = `(contact: ${inner.contactMessage?.displayName || 'unknown'})`
+    case 'contactMessage':
+    case 'contactsArrayMessage': {
+      // CONTACT_VCARD_PARSE_V1: contactMessage carries displayName + a raw
+      // vCard string; contactsArrayMessage carries an array of them. Parse
+      // both, dump the raw .vcf to INBOX_DIR so it can be imported into
+      // Google Contacts directly, and surface the structured fields
+      // (phones, emails, org, address) in the assistant prompt.
+      const rawContacts: Array<{ displayName?: string | null; vcard?: string | null }> =
+        innerType === 'contactsArrayMessage'
+          ? (inner.contactsArrayMessage?.contacts || [])
+          : [{ displayName: inner.contactMessage?.displayName, vcard: inner.contactMessage?.vcard }]
+
+      const parsedContacts = rawContacts.map((c) => {
+        const vcard = c.vcard || ''
+        const get = (re: RegExp): string[] => {
+          const out: string[] = []
+          for (const m of vcard.matchAll(re)) {
+            const v = (m[1] || '').trim()
+            if (v) out.push(v)
+          }
+          return out
+        }
+        // vCard line continuations: a line starting with space is a soft
+        // wrap from the previous one. Unfold before matching.
+        const unfolded = vcard.replace(/\r?\n[ \t]/g, '')
+        const fn       = (unfolded.match(/^FN(?:;[^:]*)?:(.+)$/m)?.[1] || '').trim()
+        const phones   = Array.from(unfolded.matchAll(/^TEL(?:;[^:]*)?:(.+)$/gm)).map(m => m[1].trim()).filter(Boolean)
+        const emails   = Array.from(unfolded.matchAll(/^EMAIL(?:;[^:]*)?:(.+)$/gm)).map(m => m[1].trim()).filter(Boolean)
+        const orgs     = Array.from(unfolded.matchAll(/^ORG(?:;[^:]*)?:(.+)$/gm)).map(m => m[1].trim()).filter(Boolean)
+        const titles   = Array.from(unfolded.matchAll(/^TITLE(?:;[^:]*)?:(.+)$/gm)).map(m => m[1].trim()).filter(Boolean)
+        // ADR format: PO;ext;street;city;region;postcode;country (semicolon-delimited)
+        const addrs    = Array.from(unfolded.matchAll(/^ADR(?:;[^:]*)?:(.+)$/gm))
+          .map(m => m[1].split(';').filter(Boolean).join(', ').trim())
+          .filter(Boolean)
+        void get  // silence linter for unused helper
+        return {
+          displayName: c.displayName || fn || 'unknown',
+          phones,
+          emails,
+          orgs,
+          titles,
+          addrs,
+          vcard,
+        }
+      })
+
+      // Persist raw vcards to inbox so they can be imported later.
+      const vcardPaths: string[] = []
+      for (let i = 0; i < parsedContacts.length; i++) {
+        const c = parsedContacts[i]
+        if (!c.vcard) continue
+        const safeName = (c.displayName || `contact-${i}`)
+          .replace(/[\/\\]/g, '_')
+          .replace(/[^\w.\-+]/g, '_')
+          .slice(0, 60) || `contact-${i}`
+        const path = join(INBOX_DIR, `${Date.now()}-${msgId}-${i}-${safeName}.vcf`)
+        try {
+          writeFileSync(path, c.vcard)
+          vcardPaths.push(path)
+          info(`vcard saved to ${path} (${c.displayName})`)
+        } catch (err) {
+          error(`vcard write failed for ${c.displayName}: ${err}`)
+        }
+      }
+
+      // Build a human-readable summary for the prompt.
+      const summarize = (c: typeof parsedContacts[0]): string => {
+        const parts: string[] = [c.displayName]
+        if (c.phones.length) parts.push(`tel: ${c.phones.join(' / ')}`)
+        if (c.emails.length) parts.push(`email: ${c.emails.join(' / ')}`)
+        if (c.orgs.length)   parts.push(`org: ${c.orgs.join(' / ')}`)
+        if (c.titles.length) parts.push(`title: ${c.titles.join(' / ')}`)
+        if (c.addrs.length)  parts.push(`addr: ${c.addrs.join(' | ')}`)
+        return parts.join('; ')
+      }
+      const summary = parsedContacts.map(summarize).join(' | ')
+      text = `(contact${parsedContacts.length > 1 ? 's' : ''}: ${summary})`
+
+      attachmentMeta = {
+        attachment_kind: parsedContacts.length > 1 ? 'contacts' : 'contact',
+        attachment_message_id: msgId,
+        contact_count: String(parsedContacts.length),
+        contact_summary: summary,
+      }
+      if (vcardPaths.length === 1) attachmentMeta.attachment_path = vcardPaths[0]
+      if (vcardPaths.length > 1)   attachmentMeta.attachment_paths = vcardPaths.join('|')
       break
     }
     case 'reactionMessage': {
@@ -1135,7 +1235,7 @@ async function handleInboundMessage(msg: proto.IWebMessageInfo): Promise<void> {
   // If user sent voice, reply with voice too (mirror modality).
   const wasVoice = innerType === 'audioMessage' && !!inner.audioMessage?.ptt
   enqueueChatTurn(chatJid, () =>
-    respondViaClaude(chatJid, text, pushName, senderJid, imagePath, wasVoice, quotedBlock, documentPath),
+    respondViaClaude(chatJid, text, pushName, senderJid, imagePath, wasVoice, quotedBlock, documentPath, videoPath),
   ).catch(err => error(`respondViaClaude failed: ${err}`))
 }
 
@@ -1499,6 +1599,7 @@ async function respondViaClaude(
   replyAsVoice: boolean,
   quotedBlock?: string,
   documentPath?: string,
+  videoPath?: string,
 ): Promise<void> {
   // Determine if sender is the bot owner (mi Señor)
   /* OWNER_VS_BOT_SPLIT_V1 + OWNER_LID_FALLBACK_V1 */
@@ -1543,7 +1644,9 @@ async function respondViaClaude(
       : `El usuario te envió una imagen en ${imagePath}. Lee la imagen con la tool Read y responde a su consulta.\n\nTexto acompañante: ${contentWithQuote}`
     : documentPath
       ? `El usuario te envió un documento en ${documentPath}. Léelo con la tool Read (si es PDF largo usa el parámetro pages) y responde a su consulta.\n\nTexto acompañante: ${contentWithQuote}`
-      : contentWithQuote
+      : videoPath
+        ? `El usuario te envió un vídeo/gif en ${videoPath}. No puedes leer el vídeo directamente: extrae unos fotogramas con ffmpeg a /tmp (ej. \`ffmpeg -y -i "${videoPath}" -vf "fps=3" -frames:v 3 /tmp/elsa_frame_%02d.jpg\`) y léelos con la tool Read para comentar su contenido. Si ffmpeg falla o no hay fotogramas, dilo con naturalidad.\n\nTexto acompañante: ${contentWithQuote}`
+        : contentWithQuote
 
   /* DASH_PROMPT_STDIN_V1 */
   const baseArgs = [
