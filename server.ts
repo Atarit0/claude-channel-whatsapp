@@ -1722,7 +1722,27 @@ async function respondViaClaude(
   // never appear in the model's actual reply — they're context formatting,
   // not content. Strip them all defensively so phantom rebotes don't reach
   // the recipient or get re-echoed back into the chat.
-  const raw = stdoutText
+  //
+  // STRIP_SDK_JSON_LEAK_V1: also drop lines that look like Anthropic SDK
+  // stream events (e.g. {"type":"assistant","message":{"model":"...","id":"msg_..."}})
+  // or pasted quoted blocks containing them. These leak when the user
+  // forwards back something they saw in another channel or when a tool
+  // result with raw stream JSON ends up in the assistant prompt. They are
+  // never useful as outbound chat text.
+  const SDK_JSON_LINE = /^\s*(?:\[?\{"type":"(?:assistant|user|system|result|tool_use|tool_result|text|content_block_start|content_block_delta|content_block_stop|message_start|message_delta|message_stop)"[\s\S]*$|^.*"message":\s*\{\s*"model":\s*"claude-[^"]+"[\s\S]*$)/
+  const stripSdkJsonLeaks = (s: string): string => {
+    const out: string[] = []
+    for (const line of s.split('\n')) {
+      if (SDK_JSON_LINE.test(line)) continue
+      // Also drop the "[En respuesta a "..." de NNN]" wrapper followed by
+      // a JSON-looking body, which is how WhatsApp quoted messages render
+      // a forwarded raw SDK event.
+      if (/^\s*\[En respuesta a\s+"[\s\S]*"type":"(assistant|user|system)"/.test(line)) continue
+      out.push(line)
+    }
+    return out.join('\n')
+  }
+  const raw = stripSdkJsonLeaks(stdoutText)
     .replace(/^[ \t]*(?:Human|Assistant):[ \t]*/gm, '')
     .replace(/^[ \t]*\[[^\]\n]{1,40}\][ \t]+/gm, '')
     .trim()
